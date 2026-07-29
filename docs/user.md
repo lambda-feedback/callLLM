@@ -1,4 +1,4 @@
-# LLM Caller
+# Call LLM
 
 Makes up to three calls to the nominated LLM:
 
