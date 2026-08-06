@@ -77,18 +77,42 @@ def process_prompt(prompt, context, answer):
 FALLBACK_FEEDBACK = "Could not evaluate the response, please try again."
 
 
-def _request_json(client, model, system_prompt, response, step):
+def _request_json(client, model, system_prompt, response, step, reasoning_effort=None):
     report_progress(f"Running {step} check...")
-    result = client.chat.completions.create(
+
+    kwargs = dict(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": response},
         ],
         response_format={"type": "json_object"},
+        stream=True,
     )
+    if reasoning_effort:
+        kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
+
+    content_parts = []
+    reasoning_buffer = ""
+    for chunk in client.chat.completions.create(**kwargs):
+        delta = chunk.choices[0].delta
+        content_piece = getattr(delta, "content", None)
+        if content_piece:
+            content_parts.append(content_piece)
+
+        reasoning_piece = getattr(delta, "reasoning", None)
+        if reasoning_piece:
+            reasoning_buffer += reasoning_piece
+            while "\n" in reasoning_buffer:
+                line, reasoning_buffer = reasoning_buffer.split("\n", 1)
+                if line:
+                    report_progress(f"{step} reasoning", data={"text": line})
+
+    if reasoning_buffer:
+        report_progress(f"{step} reasoning", data={"text": reasoning_buffer})
+
     report_progress(f"{step} check complete.".capitalize())
-    raw = result.choices[0].message.content.strip()
+    raw = "".join(content_parts).strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -96,9 +120,9 @@ def _request_json(client, model, system_prompt, response, step):
         return None
 
 
-def check_moderation(client, model, moderation_prompt, response):
+def check_moderation(client, model, moderation_prompt, response, reasoning_effort=None):
     logger.debug("running moderation check")
-    data = _request_json(client, model, moderation_prompt, response, "moderation")
+    data = _request_json(client, model, moderation_prompt, response, "moderation", reasoning_effort)
     if data is None:
         return None
     passes_moderation = bool(data["passes_moderation"])
@@ -106,14 +130,14 @@ def check_moderation(client, model, moderation_prompt, response):
     return passes_moderation
 
 
-def check_correctness(client, model, correctness_decision, response):
+def check_correctness(client, model, correctness_decision, response, reasoning_effort=None):
     logger.debug("running correctness check")
     correctness_system = (
         f"{correctness_decision}"
         ' Output your response as a JSON object with exactly 1 field: '
         '"is_correct" (boolean, true if the student response is correct, false otherwise).'
     )
-    data = _request_json(client, model, correctness_system, response, "correctness")
+    data = _request_json(client, model, correctness_system, response, "correctness", reasoning_effort)
     if data is None:
         return None
     is_correct = bool(data["is_correct"])
@@ -121,7 +145,7 @@ def check_correctness(client, model, correctness_decision, response):
     return is_correct
 
 
-def generate_feedback(client, model, correctness_decision, feedback_guidance, is_correct, response):
+def generate_feedback(client, model, correctness_decision, feedback_guidance, is_correct, response, reasoning_effort=None):
     logger.debug("running feedback check")
     verdict_note = "correct." if is_correct else "incorrect."
     feedback_system = (
@@ -129,7 +153,7 @@ def generate_feedback(client, model, correctness_decision, feedback_guidance, is
         ' Output your response as a JSON object with exactly 1 field: '
         '"feedback" (string, feedback for the student).'
     )
-    data = _request_json(client, model, feedback_system, response, "feedback")
+    data = _request_json(client, model, feedback_system, response, "feedback", reasoning_effort)
     if data is None:
         return FALLBACK_FEEDBACK
     try:
@@ -183,7 +207,9 @@ def evaluation_function(
     try:
         context = params.get("context")
         model = params.get('model', DEFAULT_MODEL)
+        reasoning_effort = params.get('reasoning_effort')
         logger.debug("model=%r", model)
+        logger.debug("reasoning_effort=%r", reasoning_effort)
 
         correctness_decision_raw = params.get(
             'correctness_decision', default_correctness_decision(context)
@@ -204,14 +230,14 @@ def evaluation_function(
         )
         include_feedback = bool(feedback_guidance_raw.strip())
 
-        passes_moderation = check_moderation(client, model, moderation_prompt, response)
+        passes_moderation = check_moderation(client, model, moderation_prompt, response, reasoning_effort)
         if passes_moderation is None:
             return _failure_result(FALLBACK_FEEDBACK, include_feedback)
         if not passes_moderation:
             logger.debug("response failed moderation")
             return _failure_result("Response did not pass moderation.", include_feedback)
 
-        is_correct = check_correctness(client, model, correctness_decision, response)
+        is_correct = check_correctness(client, model, correctness_decision, response, reasoning_effort)
         if is_correct is None:
             return _failure_result(FALLBACK_FEEDBACK, include_feedback)
 
@@ -219,7 +245,7 @@ def evaluation_function(
             return Result(is_correct=is_correct)
 
         feedback_text = generate_feedback(
-            client, model, correctness_decision, feedback_guidance, is_correct, response
+            client, model, correctness_decision, feedback_guidance, is_correct, response, reasoning_effort
         )
         result = Result(is_correct=is_correct)
         result.add_feedback("feedback", feedback_text)

@@ -12,21 +12,34 @@ BASE_PARAMS = {
 }
 
 
-def _mock_completion(content):
-    mock = MagicMock()
-    mock.choices[0].message.content = content
-    return mock
+def _mock_chunk(content=None, reasoning=None):
+    chunk = MagicMock()
+    chunk.choices[0].delta.content = content
+    chunk.choices[0].delta.reasoning = reasoning
+    return chunk
 
 
-def _patch_openai(*side_effects):
-    """Patch OpenAI so successive chat.completions.create calls return given strings.
+def _mock_stream(content, reasoning_parts=None):
+    """Build a fake streaming response: optional reasoning chunks, then the content."""
+    chunks = [_mock_chunk(reasoning=piece) for piece in (reasoning_parts or [])]
+    chunks.append(_mock_chunk(content=content))
+    return iter(chunks)
+
+
+def _patch_openai(*side_effects, reasoning_parts_per_call=None):
+    """Patch OpenAI so successive chat.completions.create calls stream the given strings.
+
+    `side_effects` are the full JSON content strings for each expected LLM call, in order.
+    `reasoning_parts_per_call`, if given, is a list (same length as `side_effects`) of
+    lists of reasoning-delta strings to stream before the content for that call.
 
     Returns (patcher, mock_client) so callers can also assert on call_count/call_args.
     """
     patcher = patch("evaluation_function.evaluation.OpenAI")
     mock_cls = patcher.start()
+    reasoning_parts_per_call = reasoning_parts_per_call or [None] * len(side_effects)
     mock_cls.return_value.chat.completions.create.side_effect = [
-        _mock_completion(c) for c in side_effects
+        _mock_stream(c, r) for c, r in zip(side_effects, reasoning_parts_per_call)
     ]
     return patcher, mock_cls.return_value
 

@@ -40,6 +40,7 @@ Requests are sent to `POST /evaluate` in µEd format.
 | `configuration.params.feedback_guidance` | no | Guidance for feedback generation. Falls back to a generic constructive-feedback prompt if omitted; pass `""` to skip feedback entirely |
 | `configuration.params.context` | no | Question/purpose text; injected into prompts via `{{context}}` |
 | `configuration.params.moderation_prompt` | no | Overrides the default moderation prompt |
+| `configuration.params.reasoning_effort` | no | OpenRouter reasoning effort (e.g. `"low"`, `"medium"`, `"high"`) to request from reasoning-capable models. When set, each stage streams its reasoning tokens out via `report_progress` as they're produced. Omitted by default — no reasoning is requested and no reasoning progress is reported |
 
 ### Prompt Template Variables
 
