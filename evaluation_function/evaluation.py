@@ -6,6 +6,7 @@ from typing import Any
 from openai import OpenAI
 from dotenv import load_dotenv
 from lf_toolkit.evaluation import Result, Params
+from lf_toolkit.evaluation.progress import report_progress
 
 load_dotenv()
 
@@ -77,6 +78,7 @@ FALLBACK_FEEDBACK = "Could not evaluate the response, please try again."
 
 
 def _request_json(client, model, system_prompt, response, step):
+    report_progress(f"Running {step} check...")
     result = client.chat.completions.create(
         model=model,
         messages=[
@@ -85,6 +87,7 @@ def _request_json(client, model, system_prompt, response, step):
         ],
         response_format={"type": "json_object"},
     )
+    report_progress(f"{step} check complete.".capitalize())
     raw = result.choices[0].message.content.strip()
     try:
         return json.loads(raw)

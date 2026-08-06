@@ -1124,8 +1124,8 @@ parsing = ["antlr4-python3-runtime (==4.13.2)", "lark (==1.2.2)", "latex2sympy @
 [package.source]
 type = "git"
 url = "https://github.com/lambda-feedback/toolkit-python.git"
-reference = "main"
-resolved_reference = "713f13fec11a1d81668fefc3199942f604ba1505"
+reference = "feature/socket_support"
+resolved_reference = "8e3a587cf5a57e6992d0947ba410bb8c4dda8202"
 
 [[package]]
 name = "mccabe"
@@ -2601,4 +2601,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "ff86b6cc288817eb051c626e83511434991d0f7cfb9a7d296ddedbe277eeb92d"
+content-hash = "c38c0d504ccf6c0a596fcad0a6d059d415317234386de7b5a80c86ce25504c0d"

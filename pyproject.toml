@@ -13,7 +13,7 @@ evaluation_function_dev = "evaluation_function.dev:dev"
 [tool.poetry.dependencies]
 python = "^3.11"
 typing_extensions = "^4.12.2"
-lf_toolkit = { git = "https://github.com/lambda-feedback/toolkit-python.git", branch = "main", extras = [
+lf_toolkit = { git = "https://github.com/lambda-feedback/toolkit-python.git", branch = "feature/socket_support", extras = [
     "ipc",
 ] }
 openai = "^2.44.0"

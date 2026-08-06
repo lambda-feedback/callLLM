@@ -1,4 +1,5 @@
-FROM ghcr.io/lambda-feedback/evaluation-function-base/python:3.12 AS builder
+ARG BASE_VERSION=python:shimmy-socket-test-3.12
+FROM ghcr.io/lambda-feedback/evaluation-function-base/$BASE_VERSION AS builder
 
 RUN pip install poetry==1.8.3
 
@@ -12,7 +13,7 @@ COPY pyproject.toml poetry.lock ./
 RUN --mount=type=cache,target=$POETRY_CACHE_DIR \
     poetry install --without dev --no-root
 
-FROM ghcr.io/lambda-feedback/evaluation-function-base/python:3.12
+FROM ghcr.io/lambda-feedback/evaluation-function-base/$BASE_VERSION
 
 ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH"
