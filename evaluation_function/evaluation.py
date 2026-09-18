@@ -84,6 +84,8 @@ def _request_json(client, model, system_prompt, response, step):
             {"role": "user", "content": response},
         ],
         response_format={"type": "json_object"},
+        # Only route to OpenRouter endpoints with Zero Data Retention policies
+        extra_body={"provider": {"zdr": True}},
     )
     raw = result.choices[0].message.content.strip()
     try:

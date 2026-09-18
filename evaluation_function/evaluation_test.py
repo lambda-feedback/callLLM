@@ -149,6 +149,19 @@ class TestEvaluationFunction(unittest.TestCase):
         for call in mock_client.chat.completions.create.call_args_list:
             self.assertEqual(call.kwargs["model"], "openai/gpt-4o-mini")
 
+    def test_requests_zero_data_retention(self):
+        moderation_payload = json.dumps({"passes_moderation": True})
+        correctness_payload = json.dumps({"is_correct": True})
+        feedback_payload = json.dumps({"feedback": "Well done, Paris is correct!"})
+        patcher, mock_client = _patch_openai(moderation_payload, correctness_payload, feedback_payload)
+        try:
+            evaluation_function("Paris", "Paris", BASE_PARAMS)
+        finally:
+            patcher.stop()
+
+        for call in mock_client.chat.completions.create.call_args_list:
+            self.assertEqual(call.kwargs["extra_body"], {"provider": {"zdr": True}})
+
     def test_default_correctness_decision_without_context(self):
         params = {"model": "openai/gpt-4o-mini"}
         moderation_payload = json.dumps({"passes_moderation": True})

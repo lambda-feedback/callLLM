@@ -12,6 +12,10 @@ Each evaluation runs up to **three sequential** LLM calls using the model specif
 
 Splitting these into separate calls means clearly manipulative submissions never pay for a correctness/feedback call, and correctness/feedback prompts stay focused on a single concern each. The worker's send timeout (`FUNCTION_WORKER_SEND_TIMEOUT` in the `Dockerfile`) is set to `120s` to give the three sequential calls enough headroom.
 
+### Zero Data Retention
+
+Every LLM call sets OpenRouter's `provider.zdr` preference, so requests are only routed to [Zero Data Retention](https://openrouter.ai/docs/features/zdr) endpoints — providers that do not store prompts or completions. A model with no ZDR endpoint cannot be used: its requests fail rather than falling back to a provider that retains data. See [Model Examples](#model-examples) for how to check a model.
+
 ## Configuration
 
 Set the `OPENROUTER_API_KEY` environment variable to your [OpenRouter API key](https://openrouter.ai/keys).
@@ -35,7 +39,7 @@ Requests are sent to `POST /evaluate` in µEd format.
 | `submission.type` | yes | Artefact type: `TEXT`, `CODE`, `MATH`, `MODEL` |
 | `submission.content.text` | yes (TEXT) | The student's response |
 | `task.referenceSolution.text` | yes | The reference answer (may be empty string) |
-| `configuration.params.model` | no | OpenRouter model ID. Defaults to `openai/gpt-4o-mini` if omitted |
+| `configuration.params.model` | no | OpenRouter model ID; must have a ZDR endpoint. Defaults to `openai/gpt-4o-mini` if omitted |
 | `configuration.params.correctness_decision` | no | Describes the evaluation criteria used to decide correctness. Falls back to a generic "compare response to answer" prompt if omitted (the fallback adapts depending on whether `context` is also provided) |
 | `configuration.params.feedback_guidance` | no | Guidance for feedback generation. Falls back to a generic constructive-feedback prompt if omitted; pass `""` to skip feedback entirely |
 | `configuration.params.context` | no | Question/purpose text; injected into prompts via `{{context}}` |
@@ -137,7 +141,7 @@ Returns an array with one feedback object:
   },
   "configuration": {
     "params": {
-      "model": "anthropic/claude-3-5-haiku",
+      "model": "anthropic/claude-haiku-4.5",
       "context": "What type of cell division produces two genetically identical daughter cells?",
       "correctness_decision": "The correct answer is {{answer}}. The question asked was: {{context}}. Assess whether the student's response is equivalent.",
       "feedback_guidance": "Give brief, encouraging feedback tailored to the student's response."
@@ -166,7 +170,7 @@ Returns an array with one feedback object:
   },
   "configuration": {
     "params": {
-      "model": "google/gemini-flash-1.5",
+      "model": "google/gemini-3.5-flash",
       "correctness_decision": "The correct answer is {{answer}}. Assess the student's understanding.",
       "feedback_guidance": "Give formative feedback to help the student improve their answer."
     }
@@ -204,16 +208,24 @@ Returns an array with one feedback object:
 
 Models are specified as OpenRouter IDs in the format `provider/model-name`. See the full list at [openrouter.ai/models](https://openrouter.ai/models).
 
+Because every call requires [Zero Data Retention](#zero-data-retention), the model must have at least one ZDR endpoint. All models below had a ZDR endpoint that supports JSON output (`response_format`) as of September 2026.
+
 | Provider | Model ID | Notes |
 |----------|----------|-------|
-| OpenAI | `openai/gpt-4o` | Best quality |
+| OpenAI | `openai/gpt-4o` | Strong general-purpose option |
 | OpenAI | `openai/gpt-4o-mini` | Fast and cheap; good default |
-| Anthropic | `anthropic/claude-3-5-sonnet` | Strong reasoning |
-| Anthropic | `anthropic/claude-3-5-haiku` | Fast Anthropic option |
-| Google | `google/gemini-flash-1.5` | Very fast and low cost |
-| Google | `google/gemini-pro-1.5` | Higher quality Google option |
-| Meta (open) | `meta-llama/llama-3.1-8b-instruct` | Free tier available |
+| Anthropic | `anthropic/claude-sonnet-5` | Strong reasoning |
+| Anthropic | `anthropic/claude-haiku-4.5` | Fast Anthropic option |
+| Google | `google/gemini-3.5-flash` | Very fast and low cost |
+| Google | `google/gemini-2.5-pro` | Higher quality Google option |
+| Meta (open) | `meta-llama/llama-3.1-8b-instruct` | Small, low-cost open model |
 | Meta (open) | `meta-llama/llama-3.1-70b-instruct` | Stronger open model |
+
+To check whether another model has ZDR endpoints, look for its ID in OpenRouter's ZDR endpoint list:
+
+```bash
+curl -s https://openrouter.ai/api/v1/endpoints/zdr | jq -r '.data[].model_id' | sort -u | grep '<model-id>'
+```
 
 > **Note:** Always use the `provider/model-name` prefix. Bare names like `gpt-4o` will not be routed correctly.
 
