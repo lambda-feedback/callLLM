@@ -20,11 +20,12 @@ logger.propagate = False
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
-# API Gateway abandons the request at 30s, so the three sequential LLM calls
-# (moderation, correctness, feedback) must finish well inside that. Without a
-# timeout the client defaults to 600s, which stalls until the Lambda is killed
-# at 120s and the caller has already been served a 503.
-LLM_REQUEST_TIMEOUT_SECONDS = 8.0
+# Stops a hung call from occupying the worker for the client's 600s default,
+# long after the shim has given up on the request. It is not what keeps us
+# inside API Gateway's 30s budget - the shim's worker send timeout does that -
+# so it is set above the observed tail rather than tight against the budget.
+# Calls average ~1.2s but reach past 8s, which was cutting off good requests.
+LLM_REQUEST_TIMEOUT_SECONDS = 12.0
 LLM_MAX_RETRIES = 0
 
 DEFAULT_CORRECTNESS_DECISION_WITH_CONTEXT = (
