@@ -20,6 +20,13 @@ logger.propagate = False
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
+# API Gateway abandons the request at 30s, so the three sequential LLM calls
+# (moderation, correctness, feedback) must finish well inside that. Without a
+# timeout the client defaults to 600s, which stalls until the Lambda is killed
+# at 120s and the caller has already been served a 503.
+LLM_REQUEST_TIMEOUT_SECONDS = 8.0
+LLM_MAX_RETRIES = 0
+
 DEFAULT_CORRECTNESS_DECISION_WITH_CONTEXT = (
     "You are grading a student's response to the following question: {{context}} "
     "The correct answer is: {{answer}}. Judge the response as correct if it conveys the "
@@ -176,7 +183,8 @@ def evaluation_function(
     client = OpenAI(
         api_key=os.environ.get("OPENROUTER_API_KEY"),
         base_url="https://openrouter.ai/api/v1",
-        max_retries=3,
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=LLM_MAX_RETRIES,
     )
 
     try:
