@@ -107,7 +107,11 @@ def check_moderation(client, model, moderation_prompt, response):
     data = _request_json(client, model, moderation_prompt, response, "moderation")
     if data is None:
         return None
-    passes_moderation = bool(data["passes_moderation"])
+    try:
+        passes_moderation = bool(data["passes_moderation"])
+    except KeyError:
+        logger.error("moderation result missing 'passes_moderation' field")
+        return None
     logger.debug("passes_moderation=%s", passes_moderation)
     return passes_moderation
 
@@ -122,7 +126,11 @@ def check_correctness(client, model, correctness_decision, response):
     data = _request_json(client, model, correctness_system, response, "correctness")
     if data is None:
         return None
-    is_correct = bool(data["is_correct"])
+    try:
+        is_correct = bool(data["is_correct"])
+    except KeyError:
+        logger.error("correctness result missing 'is_correct' field")
+        return None
     logger.debug("is_correct=%s", is_correct)
     return is_correct
 
