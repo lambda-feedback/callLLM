@@ -34,6 +34,9 @@ ENV FUNCTION_ARGS="-m,evaluation_function.main"
 # The transport to use for the RPC server
 ENV FUNCTION_RPC_TRANSPORT="stdio"
 
-ENV FUNCTION_WORKER_SEND_TIMEOUT="120s"
+# API Gateway abandons the caller at 30s, so waiting 120s on the worker means
+# the request is still running long after the client has been served a 503.
+# Stay inside the gateway budget so a stalled worker surfaces as a real error.
+ENV FUNCTION_WORKER_SEND_TIMEOUT="25s"
 
 ENV LOG_LEVEL="debug"
