@@ -160,6 +160,41 @@ def _failure_result(message, include_feedback):
         result.add_feedback("feedback", message)
     return result
 
+def _coerce_file_specs(raw: Any) -> list:
+    """Normalise a raw files value into a list of {url, name} dicts.
+
+    Entries may already be dicts, or JSON-encoded strings — the LF web
+    client currently serialises each upload entry to a string.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    specs = []
+    for entry in raw:
+        if isinstance(entry, str):
+            try:
+                entry = json.loads(entry)
+            except (ValueError, TypeError):
+                continue
+        if isinstance(entry, dict):
+            specs.append(entry)
+    return specs
+
+def _unwrap_payload(value: Any) -> tuple[str, list]:
+    payload = value
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and ("code" in parsed or "files" in parsed):
+            payload = parsed
+
+    if isinstance(payload, dict):
+        return str(payload.get("code") or ""), _coerce_file_specs(payload.get("files"))
+    if isinstance(payload, str):
+        return payload, []
+    return str(payload), []
+
 
 def evaluation_function(
     response: Any,
