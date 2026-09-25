@@ -195,6 +195,22 @@ def _unwrap_payload(value: Any) -> tuple[str, list]:
         return payload, []
     return str(payload), []
 
+def _resolve_submission(response: Any, params: Params) -> tuple[str, list]:
+    """Split the submission into (code, file_specs).
+
+    Files listed in the response take precedence; params["files"] is the
+    fallback.
+    """
+    code, response_files = _unwrap_payload(response)
+    file_specs = response_files or _coerce_file_specs(params.get("files"))
+    return code, file_specs
+
+
+def _answer_code(answer: Any) -> str:
+    """The code string from the answer field, unwrapping a {code, files}
+    payload the same way the submission is unwrapped."""
+    return _unwrap_payload(answer)[0]
+
 
 def evaluation_function(
     response: Any,
@@ -223,6 +239,9 @@ def evaluation_function(
     return types and that evaluation_function() is the main function used
     to output the evaluation response.
     """
+
+    answer = _answer_code(answer)
+    response, _ = _resolve_submission(response, params)
 
     client = OpenAI(
         api_key=os.environ.get("OPENROUTER_API_KEY"),
