@@ -65,5 +65,5 @@ jobs:
     secrets:
       aws-key-id: ${{ secrets.LAMBDA_CONTAINER_PIPELINE_AWS_ID }}
       aws-secret-key: ${{ secrets.LAMBDA_CONTAINER_PIPELINE_AWS_SECRET}}
-      function-admin-api-key: ${{ secrets.FUNCTION_ADMIN_API_KEY}}
+      function-admin-api-key-staging: ${{ secrets.FUNCTION_ADMIN_API_KEY_STAGING }}
       gcp_credentials: ${{ secrets.GCP_DEPLOY }}
