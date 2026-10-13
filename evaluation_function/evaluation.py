@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from typing import Any
+import openai
 from openai import OpenAI
 from dotenv import load_dotenv
 from lf_toolkit.evaluation import Result, Params
@@ -83,19 +84,121 @@ def process_prompt(prompt, context, answer):
 
 FALLBACK_FEEDBACK = "Could not evaluate the response, please try again."
 
+# Explanations for OpenRouter's documented error status codes.
+OPENROUTER_ERROR_HINTS = {
+    400: "bad request - invalid or unsupported parameters (e.g. the model may not support JSON response_format)",
+    401: "invalid or missing OPENROUTER_API_KEY",
+    402: "insufficient OpenRouter credits",
+    403: "input was flagged by the provider's moderation",
+    404: "model not found - check the model slug",
+    408: "request timed out upstream",
+    429: "rate limited by OpenRouter or the provider",
+    502: "the model provider is down or returned an invalid response",
+    503: (
+        "no available provider meets the routing requirements - Zero Data Retention "
+        "(provider.zdr) may exclude every endpoint for this model"
+    ),
+}
+
+
+class LLMCallError(Exception):
+    """A call to OpenRouter failed, with a readable description of why."""
+
+    def __init__(self, message, step, model, status_code=None, code=None, provider=None):
+        super().__init__(message)
+        self.step = step
+        self.model = model
+        self.status_code = status_code
+        self.code = code
+        self.provider = provider
+
+
+def _openrouter_error_detail(body):
+    """Extract (code, message, provider, extra) from an OpenRouter error body.
+
+    OpenRouter errors look like
+    {"error": {"code": int, "message": str, "metadata": {...}}}; the SDK may
+    hand over either the whole body or just the inner "error" object.
+    """
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        body = body["error"]
+    if not isinstance(body, dict):
+        return None, str(body) if body else None, None, None
+
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    provider = metadata.get("provider_name")
+    extra = None
+    if metadata.get("reasons"):
+        extra = f"reasons: {', '.join(map(str, metadata['reasons']))}"
+    elif metadata.get("raw"):
+        extra = f"provider said: {metadata['raw']}"
+    return body.get("code"), body.get("message"), provider, extra
+
+
+def _status_error(step, model, status_code, body):
+    code, message, provider, extra = _openrouter_error_detail(body)
+    if status_code is None and isinstance(code, int):
+        status_code = code
+    parts = [message or "unknown error"]
+    hint = OPENROUTER_ERROR_HINTS.get(status_code)
+    if hint:
+        parts.append(hint)
+    if extra:
+        parts.append(extra)
+    where = f"model={model}" + (f", provider={provider}" if provider else "")
+    label = f"OpenRouter error {status_code}" if status_code else "OpenRouter error"
+    text = f"{label} during {step} ({where}): {' - '.join(parts)}"
+    logger.error(text)
+    return LLMCallError(text, step, model, status_code=status_code, code=code, provider=provider)
+
+
+def _call_error(step, model, text):
+    text = f"{text} during {step} (model={model})"
+    logger.error(text)
+    return LLMCallError(text, step, model)
+
 
 def _request_json(client, model, system_prompt, response, step):
-    result = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": response},
-        ],
-        response_format={"type": "json_object"},
-        # Only route to OpenRouter endpoints with Zero Data Retention policies
-        extra_body={"provider": {"zdr": True}},
-    )
-    raw = result.choices[0].message.content.strip()
+    try:
+        result = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": response},
+            ],
+            response_format={"type": "json_object"},
+            # Only route to OpenRouter endpoints with Zero Data Retention policies
+            extra_body={"provider": {"zdr": True}},
+        )
+    # APITimeoutError subclasses APIConnectionError, so it must come first.
+    except openai.APITimeoutError as e:
+        raise _call_error(
+            step, model, f"OpenRouter request timed out after {LLM_REQUEST_TIMEOUT_SECONDS:g}s"
+        ) from e
+    except openai.APIConnectionError as e:
+        raise _call_error(step, model, f"Could not connect to OpenRouter: {e}") from e
+    except openai.APIStatusError as e:
+        raise _status_error(step, model, e.status_code, e.body) from e
+
+    # OpenRouter can report a provider failure inside a 200 response.
+    body_error = getattr(result, "error", None)
+    if body_error:
+        raise _status_error(step, model, None, body_error)
+
+    if not result.choices:
+        raise _call_error(step, model, "OpenRouter returned no choices")
+    choice = result.choices[0]
+    if choice.finish_reason == "error":
+        raise _call_error(step, model, "The model provider reported an error mid-generation")
+    if choice.finish_reason == "content_filter":
+        raise _call_error(step, model, "The model's output was blocked by a content filter")
+
+    content = choice.message.content if choice.message else None
+    raw = (content or "").strip()
+    if not raw:
+        raise _call_error(
+            step, model, f"OpenRouter returned an empty response (finish_reason={choice.finish_reason})"
+        )
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
