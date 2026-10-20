@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -34,14 +35,62 @@ INCORRECT = json.dumps({"is_correct": False})
 FEEDBACK = json.dumps({"feedback": "Well done, Paris is correct!"})
 
 
+class _FakeStream:
+    """A streamed completion. It has no network_stream, so the attempt timer
+    falls back to close()."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.response = SimpleNamespace(extensions={})
+        self.closed = False
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            if self.closed:
+                return
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+    def fresh(self):
+        return _FakeStream(self._chunks)
+
+
+class _StalledStream(_FakeStream):
+    """Sends keep-alive chunks with no content until closed, as OpenRouter
+    does while a slow model is generating."""
+
+    def __init__(self):
+        super().__init__([])
+        self._closed = threading.Event()
+
+    def __iter__(self):
+        while not self._closed.wait(0.01):
+            yield SimpleNamespace(choices=[], error=None)
+
+    def close(self):
+        super().close()
+        self._closed.set()
+
+    def fresh(self):
+        return _StalledStream()
+
+
+def _chunk(content, finish_reason=None):
+    choice = SimpleNamespace(delta=SimpleNamespace(content=content), finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], error=None)
+
+
 def _mock_completion(content, finish_reason="stop", error=None, choices=None):
-    if choices is None:
-        choices = [
-            SimpleNamespace(
-                finish_reason=finish_reason, message=SimpleNamespace(content=content)
-            )
-        ]
-    return SimpleNamespace(choices=choices, error=error)
+    if error is not None:
+        return _FakeStream([SimpleNamespace(choices=[], error=error)])
+    if choices is not None:
+        return _FakeStream([SimpleNamespace(choices=choices, error=None)])
+    # Split the content over two chunks so the attempt has to join them.
+    content = content or ""
+    half = len(content) // 2
+    return _FakeStream([_chunk(content[:half]), _chunk(content[half:], finish_reason)])
 
 
 def _request():
@@ -105,7 +154,10 @@ class _FakeOpenRouter:
             item = self._queues[step].pop(0)
         if isinstance(item, BaseException):
             raise item
-        return _mock_completion(item) if isinstance(item, str) else item
+        if isinstance(item, str):
+            return _mock_completion(item)
+        # A list may repeat one stream; each call gets its own, as with real streams.
+        return item.fresh() if isinstance(item, _FakeStream) else item
 
     def all_calls(self):
         return [call for calls in self.calls.values() for call in calls]
@@ -344,6 +396,54 @@ class TestRetries(unittest.TestCase):
 
         self.assertIn("deadline reached", ctx.exception.detail)
         self.assertEqual(fake.all_calls(), [])
+
+    def test_stalled_stream_times_out_at_attempt_timeout(self):
+        # Keep-alive chunks reset a per-read timeout, so only the attempt
+        # timer can end this call.
+        with patch.object(evaluation, "LLM_ATTEMPT_TIMEOUT_SECONDS", 0.2), \
+                _openrouter([_StalledStream()] * 2, [CORRECT]) as fake:
+            started = time.monotonic()
+            with self.assertRaises(LLMTimeoutError) as ctx:
+                evaluation_function("Paris", "Paris", BASE_PARAMS)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(len(fake.calls["moderation"]), 2)
+        self.assertLess(elapsed, 2.0)
+        self.assertIn("timed out after 0.2s during moderation", ctx.exception.detail)
+
+    def test_read_timeout_mid_stream_is_retried(self):
+        class _ReadTimeoutStream(_FakeStream):
+            def __iter__(self):
+                yield _chunk("{")
+                raise httpx.ReadTimeout("read timed out")
+
+            def fresh(self):
+                return _ReadTimeoutStream([])
+
+        with _openrouter([_ReadTimeoutStream([]), MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(len(fake.calls["moderation"]), 2)
+
+    def test_error_event_mid_stream(self):
+        class _ErrorEventStream(_FakeStream):
+            def __iter__(self):
+                yield _chunk("{")
+                raise openai.APIError(
+                    "Provider disconnected", _request(),
+                    body={"code": 502, "message": "Provider disconnected"},
+                )
+
+            def fresh(self):
+                return _ErrorEventStream([])
+
+        with _openrouter([_ErrorEventStream([])] * 2, [CORRECT]) as fake:
+            with self.assertRaises(LLMUnavailableError) as ctx:
+                evaluation_function("Paris", "Paris", BASE_PARAMS)
+
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(len(fake.calls["moderation"]), 2)
 
     def test_retryable_statuses_retried_once(self):
         for status in (408, 429, 500, 502, 503):

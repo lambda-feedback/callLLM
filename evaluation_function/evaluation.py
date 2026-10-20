@@ -1,10 +1,13 @@
 import json
 import logging
 import os
+import socket
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+import httpx
 import openai
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -213,14 +216,41 @@ def _call_error(step, model, text, cls=LLMCallError, reason=None):
     return cls(text, step, model, reason=reason)
 
 
+def _shutdown_socket(stream):
+    network_stream = stream.response.extensions.get("network_stream")
+    sock = network_stream.get_extra_info("socket") if network_stream else None
+    if sock is None:
+        stream.close()
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 def _attempt(client, model, system_prompt, response, step, timeout, extra_body):
     """Make one OpenRouter call and return the stripped message content.
+
+    The call is streamed so that timeout caps the whole attempt: the SDK's
+    timeout only bounds each read, and OpenRouter sends keep-alive bytes while
+    a model is generating, so a non-streamed call can run far past it.
 
     Raises LLMCallError; LLMTimeoutError and LLMUnavailableError mark failures
     worth retrying.
     """
+    timed_out = _call_error(
+        step, model, f"OpenRouter request timed out after {timeout:.3g}s",
+        LLMTimeoutError, f"timeout after {timeout:.3g}s",
+    )
+    attempt_deadline = time.monotonic() + timeout
+    stream = None
+    timer = None
+    expired = threading.Event()
+    content = []
+    finish_reason = None
+    saw_choice = False
     try:
-        result = client.with_options(timeout=timeout).chat.completions.create(
+        stream = client.with_options(timeout=timeout).chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -228,13 +258,38 @@ def _attempt(client, model, system_prompt, response, step, timeout, extra_body):
             ],
             response_format={"type": "json_object"},
             extra_body=extra_body,
+            stream=True,
         )
+
+        # Closing the response from another thread doesn't wake a read that is
+        # blocked on the socket, so shut the socket down; the read then raises,
+        # and expired tells that apart from a real connection failure.
+        def expire():
+            expired.set()
+            _shutdown_socket(stream)
+
+        timer = threading.Timer(max(attempt_deadline - time.monotonic(), 0), expire)
+        timer.daemon = True
+        timer.start()
+
+        for chunk in stream:
+            if expired.is_set():
+                break
+            # OpenRouter can report a provider failure inside a 200 response.
+            body_error = getattr(chunk, "error", None)
+            if body_error:
+                raise _status_error(step, model, None, body_error)
+            if not chunk.choices:
+                continue
+            saw_choice = True
+            choice = chunk.choices[0]
+            if choice.delta and choice.delta.content:
+                content.append(choice.delta.content)
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
     # APITimeoutError subclasses APIConnectionError, so it must come first.
     except openai.APITimeoutError as e:
-        raise _call_error(
-            step, model, f"OpenRouter request timed out after {timeout:.3g}s",
-            LLMTimeoutError, f"timeout after {timeout:.3g}s",
-        ) from e
+        raise timed_out from e
     except openai.APIConnectionError as e:
         raise _call_error(
             step, model, f"Could not connect to OpenRouter: {e}",
@@ -244,30 +299,46 @@ def _attempt(client, model, system_prompt, response, step, timeout, extra_body):
         raise _status_error(
             step, model, e.status_code, e.body, _retry_after_seconds(e.response)
         ) from e
+    # An error event mid-stream, which the SDK raises without a status code.
+    except openai.APIError as e:
+        if expired.is_set():
+            raise timed_out from e
+        raise _status_error(step, model, None, e.body) from e
+    # Reads during iteration raise httpx errors, not the SDK's own.
+    except httpx.TimeoutException as e:
+        raise timed_out from e
+    except httpx.TransportError as e:
+        if expired.is_set():
+            raise timed_out from e
+        raise _call_error(
+            step, model, f"Connection to OpenRouter failed mid-response: {e}",
+            LLMUnavailableError, "connection error",
+        ) from e
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if stream is not None:
+            stream.close()
 
-    # OpenRouter can report a provider failure inside a 200 response.
-    body_error = getattr(result, "error", None)
-    if body_error:
-        raise _status_error(step, model, None, body_error)
+    if expired.is_set():
+        raise timed_out
 
-    if not result.choices:
+    if not saw_choice:
         raise _call_error(
             step, model, "OpenRouter returned no choices", LLMUnavailableError, "no choices"
         )
-    choice = result.choices[0]
-    if choice.finish_reason == "error":
+    if finish_reason == "error":
         raise _call_error(
             step, model, "The model provider reported an error mid-generation",
             LLMUnavailableError, "finish_reason=error",
         )
-    if choice.finish_reason == "content_filter":
+    if finish_reason == "content_filter":
         raise _call_error(step, model, "The model's output was blocked by a content filter")
 
-    content = choice.message.content if choice.message else None
-    raw = (content or "").strip()
+    raw = "".join(content).strip()
     if not raw:
         raise _call_error(
-            step, model, f"OpenRouter returned an empty response (finish_reason={choice.finish_reason})"
+            step, model, f"OpenRouter returned an empty response (finish_reason={finish_reason})"
         )
     return raw
 
