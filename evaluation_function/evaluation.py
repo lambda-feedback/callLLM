@@ -116,13 +116,15 @@ class LLMCallError(Exception):
     """
 
     def __init__(self, message, step, model, status_code=None, code=None, provider=None,
-                 reason=None, retry_after=None):
+                 reason=None, retry_after=None, provider_error_code=None):
         super().__init__(message)
         self.step = step
         self.model = model
         self.status_code = status_code
         self.code = code
         self.provider = provider
+        # The provider's own error code, e.g. "content_filter".
+        self.provider_error_code = provider_error_code
         # Short label for retry logs, e.g. "status 502".
         self.reason = reason
         self.retry_after = retry_after
@@ -137,7 +139,8 @@ class LLMUnavailableError(LLMCallError):
 
 
 def _openrouter_error_detail(body):
-    """Extract (code, message, provider, extra) from an OpenRouter error body.
+    """Extract (code, message, provider, provider_error_code, extra) from an
+    OpenRouter error body.
 
     OpenRouter errors look like
     {"error": {"code": int, "message": str, "metadata": {...}}}; the SDK may
@@ -149,14 +152,19 @@ def _openrouter_error_detail(body):
     if isinstance(body, dict) and isinstance(body.get("error"), dict):
         body = body["error"]
     if not isinstance(body, dict):
-        return None, str(body) if body else None, None, None
+        return None, str(body) if body else None, None, None, None
 
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     provider = metadata.get("provider_name")
+    provider_error_code = metadata.get("provider_error_code")
     extra = None
     if metadata.get("reasons"):
         extra = f"reasons: {', '.join(map(str, metadata['reasons']))}"
-    return body.get("code"), body.get("message"), provider, extra
+    elif provider_error_code == "content_filter":
+        extra = "the provider's content filter blocked the input"
+    elif provider_error_code:
+        extra = f"provider error code: {provider_error_code}"
+    return body.get("code"), body.get("message"), provider, provider_error_code, extra
 
 
 def _retry_after_seconds(response):
@@ -167,12 +175,13 @@ def _retry_after_seconds(response):
 
 
 def _status_error(step, model, status_code, body, retry_after=None):
-    code, message, provider, extra = _openrouter_error_detail(body)
+    code, message, provider, provider_error_code, extra = _openrouter_error_detail(body)
     if status_code is None and isinstance(code, int):
         status_code = code
     parts = [message or "unknown error"]
     hint = OPENROUTER_ERROR_HINTS.get(status_code)
-    if hint:
+    # The generic 400 hint is misleading when the provider filtered the input.
+    if hint and provider_error_code != "content_filter":
         parts.append(hint)
     if extra:
         parts.append(extra)
@@ -183,6 +192,7 @@ def _status_error(step, model, status_code, body, retry_after=None):
     return cls(
         text, step, model, status_code=status_code, code=code, provider=provider,
         reason=f"status {status_code}", retry_after=retry_after,
+        provider_error_code=provider_error_code,
     )
 
 
@@ -291,7 +301,10 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
             )
             wait = _retry_wait(error, attempt, deadline)
             if wait is None:
-                logger.error("%s", error)
+                # A content-filtered submission is the student's doing, not a
+                # fault, so it doesn't warrant an ERROR.
+                level = logging.WARNING if _is_input_content_filter(error) else logging.ERROR
+                logger.log(level, "%s", error)
                 raise
             logger.warning(
                 "retrying %s after %s (attempt %d/%d, %.1fs left)",
@@ -323,11 +336,24 @@ def _extra_body(model, fallback_models):
     return extra_body
 
 
+def _is_input_content_filter(error):
+    """The provider refused the input itself, e.g. Azure's jailbreak filter."""
+    return error.status_code == 400 and error.provider_error_code == "content_filter"
+
+
 def check_moderation(client, model, moderation_prompt, response, deadline, extra_body):
     logger.debug("running moderation check")
-    data = _request_json(
-        client, model, moderation_prompt, response, "moderation", deadline, extra_body
-    )
+    try:
+        data = _request_json(
+            client, model, moderation_prompt, response, "moderation", deadline, extra_body
+        )
+    except LLMCallError as e:
+        # A provider that blocks the submission outright has, in effect,
+        # moderated it; other 400s are configuration errors and still raise.
+        if not _is_input_content_filter(e):
+            raise
+        logger.warning("moderation input blocked by provider content filter, treating as failed moderation")
+        return False
     if data is None:
         return None
     try:
