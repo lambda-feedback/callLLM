@@ -17,6 +17,7 @@ lf_toolkit = { git = "https://github.com/lambda-feedback/toolkit-python.git", ta
     "ipc",
 ] }
 openai = "^2.44.0"
+httpx = "^0.28.1"
 python-dotenv = "^1.2.2"
 
 [tool.poetry.group.dev.dependencies]
