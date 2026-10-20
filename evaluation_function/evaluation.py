@@ -8,6 +8,7 @@ from typing import Any
 import openai
 from openai import OpenAI
 from dotenv import load_dotenv
+from lf_toolkit import EvaluationFunctionError, UpstreamTimeoutError, UpstreamUnavailableError
 from lf_toolkit.evaluation import Result, Params
 
 load_dotenv()
@@ -108,16 +109,23 @@ OPENROUTER_ERROR_HINTS = {
 }
 
 
-class LLMCallError(Exception):
-    """A call to OpenRouter failed, with a readable description of why.
+class LLMCallError(EvaluationFunctionError):
+    """A call to OpenRouter failed.
 
-    Messages must never contain the student's submission, the answer or the
-    prompts, since they are logged and passed back to the caller.
+    str(e) is the class's public message, which lf_toolkit passes to the
+    caller; detail holds the diagnostics, which are only logged. Neither may
+    contain the student's submission, the answer or the prompts.
+
+    The toolkit base class sets the JSON-RPC code (rpc_code) and error code
+    (file_code): 500 / INTERNAL_ERROR here, 424 for the retryable subclasses.
     """
 
-    def __init__(self, message, step, model, status_code=None, code=None, provider=None,
+    public_message = "The evaluation function could not get a response from its language model."
+
+    def __init__(self, detail, step, model, status_code=None, code=None, provider=None,
                  reason=None, retry_after=None, provider_error_code=None):
-        super().__init__(message)
+        super().__init__(self.public_message)
+        self.detail = detail
         self.step = step
         self.model = model
         self.status_code = status_code
@@ -130,12 +138,16 @@ class LLMCallError(Exception):
         self.retry_after = retry_after
 
 
-class LLMTimeoutError(LLMCallError):
+class LLMTimeoutError(LLMCallError, UpstreamTimeoutError):
     """OpenRouter did not answer in time, or the eval ran out of deadline."""
 
+    public_message = "The feedback service took too long to respond. Please try again."
 
-class LLMUnavailableError(LLMCallError):
+
+class LLMUnavailableError(LLMCallError, UpstreamUnavailableError):
     """OpenRouter or the provider failed in a way that may succeed on retry."""
+
+    public_message = "The feedback service is temporarily unavailable. Please try again."
 
 
 def _openrouter_error_detail(body):
@@ -286,7 +298,7 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
                 step, model, f"Eval deadline reached with {max(remaining, 0):.1f}s left",
                 LLMTimeoutError, "deadline",
             )
-            logger.error("%s", error)
+            logger.error("%s", error.detail)
             raise error
 
         started = time.monotonic()
@@ -304,7 +316,7 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
                 # A content-filtered submission is the student's doing, not a
                 # fault, so it doesn't warrant an ERROR.
                 level = logging.WARNING if _is_input_content_filter(error) else logging.ERROR
-                logger.log(level, "%s", error)
+                logger.log(level, "%s", error.detail)
                 raise
             logger.warning(
                 "retrying %s after %s (attempt %d/%d, %.1fs left)",
@@ -565,7 +577,7 @@ def evaluation_function(
             )
         except LLMCallError as e:
             # The grade is already known; don't throw it away over feedback.
-            logger.warning("feedback failed, keeping is_correct: %s", e)
+            logger.warning("feedback failed, keeping is_correct: %s", e.detail)
             feedback_text = FALLBACK_FEEDBACK
         result = Result(is_correct=is_correct)
         result.add_feedback("feedback", feedback_text)

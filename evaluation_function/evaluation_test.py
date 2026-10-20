@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 import unittest
@@ -7,6 +8,8 @@ from unittest.mock import patch
 
 import httpx
 import openai
+from lf_toolkit import UpstreamTimeoutError, UpstreamUnavailableError
+from lf_toolkit.io.rpc_handler import JsonRpcHandler
 
 from . import evaluation
 from .evaluation import (
@@ -219,8 +222,8 @@ class TestEvaluationFunction(unittest.TestCase):
 
         self.assertEqual(ctx.exception.step, "correctness")
         self.assertEqual(ctx.exception.provider_error_code, "content_filter")
-        self.assertIn("content filter blocked the input", str(ctx.exception))
-        self.assertNotIn("response_format", str(ctx.exception))
+        self.assertIn("content filter blocked the input", ctx.exception.detail)
+        self.assertNotIn("response_format", ctx.exception.detail)
 
     def test_moderation_error_propagates_when_correctness_succeeds(self):
         with _openrouter([_status_error(401, {"code": 401, "message": "No auth"})], [CORRECT]):
@@ -311,7 +314,7 @@ class TestRetries(unittest.TestCase):
             with self.assertRaises(LLMTimeoutError) as ctx:
                 evaluation_function("Paris", "Paris", BASE_PARAMS)
 
-        self.assertIn("timed out after 8s during moderation", str(ctx.exception))
+        self.assertIn("timed out after 8s during moderation", ctx.exception.detail)
         self.assertEqual(len(fake.calls["moderation"]), 2)
 
     def test_retry_logs_warning(self):
@@ -339,7 +342,7 @@ class TestRetries(unittest.TestCase):
             with self.assertRaises(LLMTimeoutError) as ctx:
                 evaluation_function("Paris", "Paris", BASE_PARAMS)
 
-        self.assertIn("deadline reached", str(ctx.exception))
+        self.assertIn("deadline reached", ctx.exception.detail)
         self.assertEqual(fake.all_calls(), [])
 
     def test_retryable_statuses_retried_once(self):
@@ -419,7 +422,7 @@ class TestOpenRouterErrors(unittest.TestCase):
         error = self._evaluate_expecting_error(
             [_status_error(402, {"code": 402, "message": "Insufficient credits"})]
         )
-        message = str(error)
+        message = error.detail
         self.assertEqual(error.status_code, 402)
         self.assertEqual(error.step, "moderation")
         self.assertIn("OpenRouter error 402 during moderation", message)
@@ -433,7 +436,7 @@ class TestOpenRouterErrors(unittest.TestCase):
         )
         self.assertIsInstance(error, LLMUnavailableError)
         self.assertEqual(error.status_code, 503)
-        self.assertIn("Zero Data Retention", str(error))
+        self.assertIn("Zero Data Retention", error.detail)
 
     def test_provider_error_includes_provider_name(self):
         body = {
@@ -444,7 +447,7 @@ class TestOpenRouterErrors(unittest.TestCase):
         error = self._evaluate_expecting_error(
             [MOD_PASS], [_status_error(502, body), _status_error(502, body)]
         )
-        message = str(error)
+        message = error.detail
         self.assertIsInstance(error, LLMUnavailableError)
         self.assertEqual(error.provider, "Azure")
         self.assertEqual(error.step, "correctness")
@@ -459,31 +462,31 @@ class TestOpenRouterErrors(unittest.TestCase):
             "metadata": {"reasons": ["harassment"], "provider_name": "OpenAI"},
         }
         error = self._evaluate_expecting_error([_status_error(403, body)])
-        self.assertIn("reasons: harassment", str(error))
+        self.assertIn("reasons: harassment", error.detail)
 
     def test_connection_error(self):
         error = self._evaluate_expecting_error(
             [openai.APIConnectionError(request=_request())] * 2
         )
         self.assertIsInstance(error, LLMUnavailableError)
-        self.assertIn("Could not connect to OpenRouter", str(error))
+        self.assertIn("Could not connect to OpenRouter", error.detail)
 
     def test_no_choices(self):
         error = self._evaluate_expecting_error([_mock_completion(None, choices=[])] * 2)
         self.assertIsInstance(error, LLMUnavailableError)
-        self.assertIn("returned no choices", str(error))
+        self.assertIn("returned no choices", error.detail)
 
     def test_empty_content(self):
         error = self._evaluate_expecting_error([_mock_completion(None, finish_reason="length")])
         self.assertIs(type(error), LLMCallError)
-        self.assertIn("empty response (finish_reason=length)", str(error))
+        self.assertIn("empty response (finish_reason=length)", error.detail)
 
     def test_content_filter_not_retried(self):
         error = self._evaluate_expecting_error(
             [_mock_completion("", finish_reason="content_filter"), MOD_PASS]
         )
         self.assertIs(type(error), LLMCallError)
-        self.assertIn("blocked by a content filter", str(error))
+        self.assertIn("blocked by a content filter", error.detail)
 
     def test_error_in_200_body(self):
         body_error = {
@@ -494,13 +497,77 @@ class TestOpenRouterErrors(unittest.TestCase):
         error = self._evaluate_expecting_error([_mock_completion(None, error=body_error)] * 2)
         self.assertIsInstance(error, LLMUnavailableError)
         self.assertEqual(error.status_code, 502)
-        self.assertIn("Provider disconnected", str(error))
-        self.assertIn("provider=Together", str(error))
+        self.assertIn("Provider disconnected", error.detail)
+        self.assertIn("provider=Together", error.detail)
 
     def test_finish_reason_error(self):
         error = self._evaluate_expecting_error([_mock_completion("", finish_reason="error")] * 2)
         self.assertIsInstance(error, LLMUnavailableError)
-        self.assertIn("reported an error mid-generation", str(error))
+        self.assertIn("reported an error mid-generation", error.detail)
+
+
+class TestTypedErrors(unittest.TestCase):
+    """Errors carry the JSON-RPC code and error code lf_toolkit reports them
+    with, and a public message that leaves the diagnostics out."""
+
+    def _error(self, moderation):
+        with _openrouter(moderation, [CORRECT]) as fake:
+            with self.assertRaises(LLMCallError) as ctx:
+                evaluation_function("Paris", "Paris", BASE_PARAMS)
+        return ctx.exception, fake
+
+    def test_timeout_is_upstream_timeout(self):
+        error, _ = self._error([_timeout(), _timeout()])
+        self.assertIsInstance(error, UpstreamTimeoutError)
+        self.assertEqual(error.rpc_code, 424)
+        self.assertEqual(error.file_code, "UPSTREAM_TIMEOUT")
+        self.assertEqual(str(error), LLMTimeoutError.public_message)
+
+    def test_unavailable_is_upstream_unavailable(self):
+        error, _ = self._error([_status_error(502, {"code": 502, "message": "down"})] * 2)
+        self.assertIsInstance(error, UpstreamUnavailableError)
+        self.assertEqual(error.rpc_code, 424)
+        self.assertEqual(error.file_code, "UPSTREAM_UNAVAILABLE")
+        self.assertEqual(str(error), LLMUnavailableError.public_message)
+
+    def test_configuration_error_is_internal(self):
+        for status in (401, 402):
+            with self.subTest(status=status):
+                error, fake = self._error([_status_error(status, {"code": status, "message": "nope"})])
+                self.assertIs(type(error), LLMCallError)
+                self.assertEqual(error.rpc_code, 500)
+                self.assertEqual(error.file_code, "INTERNAL_ERROR")
+                self.assertEqual(len(fake.calls["moderation"]), 1)
+
+    def test_public_message_hides_detail(self):
+        error, _ = self._error([_status_error(401, {"code": 401, "message": "No auth"})])
+        self.assertEqual(str(error), LLMCallError.public_message)
+        self.assertNotIn("401", str(error))
+        self.assertIn("OpenRouter error 401 during moderation", error.detail)
+        self.assertIn("invalid or missing OPENROUTER_API_KEY", error.detail)
+
+    def test_detail_is_logged(self):
+        with _openrouter([_timeout(), _timeout()], [CORRECT]):
+            with self.assertLogs("evaluation_function.evaluation", level="ERROR") as logs:
+                with self.assertRaises(LLMTimeoutError):
+                    evaluation_function("Paris", "Paris", BASE_PARAMS)
+
+        self.assertTrue(any("timed out after 8s during moderation" in line for line in logs.output))
+
+    def test_toolkit_reports_timeout_as_424(self):
+        handler = JsonRpcHandler()
+        handler.register("eval", evaluation_function)
+        # Shimmy sends params as a single positional array.
+        request = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "eval",
+            "params": [{"response": "Paris", "answer": "Paris", "params": BASE_PARAMS}],
+        })
+        with _openrouter([_timeout(), _timeout()], [CORRECT]):
+            reply = json.loads(asyncio.run(handler.dispatch(request)))
+
+        self.assertEqual(reply["error"]["code"], 424)
+        self.assertEqual(reply["error"]["message"], LLMTimeoutError.public_message)
+        self.assertEqual(reply["error"]["data"], {"code": "UPSTREAM_TIMEOUT"})
 
 
 class TestNoStudentDataLogged(unittest.TestCase):
@@ -521,6 +588,7 @@ class TestNoStudentDataLogged(unittest.TestCase):
             self.assertNotIn(self.SECRET, record.getMessage())
         if error is not None:
             self.assertNotIn(self.SECRET, str(error))
+            self.assertNotIn(self.SECRET, error.detail)
         return error
 
     def test_success(self):
