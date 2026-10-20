@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 import openai
 from openai import OpenAI
@@ -21,13 +23,18 @@ logger.propagate = False
 
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
-# Stops a hung call from occupying the worker for the client's 600s default,
-# long after the shim has given up on the request. It is not what keeps us
-# inside API Gateway's 30s budget - the shim's worker send timeout does that -
-# so it is set above the observed tail rather than tight against the budget.
-# Calls average ~1.2s but reach past 8s, which was cutting off good requests.
-LLM_REQUEST_TIMEOUT_SECONDS = 12.0
-LLM_MAX_RETRIES = 0
+# Every LLM call in one eval shares a deadline, 3s under the shim's 25s worker
+# send timeout (itself inside API Gateway's ~29s), so a slow call is retried
+# rather than failing the eval while there is still time to answer. Calls
+# average ~1.2s but have a tail past 8s; a second attempt usually lands on a
+# faster provider. The SDK's own retries stay off so the deadline governs.
+EVAL_DEADLINE_SECONDS = 22.0
+LLM_ATTEMPT_TIMEOUT_SECONDS = 8.0
+LLM_MAX_ATTEMPTS = 2
+# Don't start an attempt with less time than this left.
+LLM_MIN_ATTEMPT_SECONDS = 2.0
+LLM_RETRY_BACKOFF_SECONDS = 0.25
+RETRYABLE_STATUS = {408, 429, 500, 502, 503}
 
 DEFAULT_CORRECTNESS_DECISION_WITH_CONTEXT = (
     "You are grading a student's response to the following question: {{context}} "
@@ -102,15 +109,31 @@ OPENROUTER_ERROR_HINTS = {
 
 
 class LLMCallError(Exception):
-    """A call to OpenRouter failed, with a readable description of why."""
+    """A call to OpenRouter failed, with a readable description of why.
 
-    def __init__(self, message, step, model, status_code=None, code=None, provider=None):
+    Messages must never contain the student's submission, the answer or the
+    prompts, since they are logged and passed back to the caller.
+    """
+
+    def __init__(self, message, step, model, status_code=None, code=None, provider=None,
+                 reason=None, retry_after=None):
         super().__init__(message)
         self.step = step
         self.model = model
         self.status_code = status_code
         self.code = code
         self.provider = provider
+        # Short label for retry logs, e.g. "status 502".
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+class LLMTimeoutError(LLMCallError):
+    """OpenRouter did not answer in time, or the eval ran out of deadline."""
+
+
+class LLMUnavailableError(LLMCallError):
+    """OpenRouter or the provider failed in a way that may succeed on retry."""
 
 
 def _openrouter_error_detail(body):
@@ -119,6 +142,9 @@ def _openrouter_error_detail(body):
     OpenRouter errors look like
     {"error": {"code": int, "message": str, "metadata": {...}}}; the SDK may
     hand over either the whole body or just the inner "error" object.
+
+    metadata.raw (the provider's own error text) and metadata.flagged_input
+    are deliberately ignored: either can echo back the student's submission.
     """
     if isinstance(body, dict) and isinstance(body.get("error"), dict):
         body = body["error"]
@@ -130,12 +156,17 @@ def _openrouter_error_detail(body):
     extra = None
     if metadata.get("reasons"):
         extra = f"reasons: {', '.join(map(str, metadata['reasons']))}"
-    elif metadata.get("raw"):
-        extra = f"provider said: {metadata['raw']}"
     return body.get("code"), body.get("message"), provider, extra
 
 
-def _status_error(step, model, status_code, body):
+def _retry_after_seconds(response):
+    try:
+        return float(response.headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _status_error(step, model, status_code, body, retry_after=None):
     code, message, provider, extra = _openrouter_error_detail(body)
     if status_code is None and isinstance(code, int):
         status_code = code
@@ -148,37 +179,49 @@ def _status_error(step, model, status_code, body):
     where = f"model={model}" + (f", provider={provider}" if provider else "")
     label = f"OpenRouter error {status_code}" if status_code else "OpenRouter error"
     text = f"{label} during {step} ({where}): {' - '.join(parts)}"
-    logger.error(text)
-    return LLMCallError(text, step, model, status_code=status_code, code=code, provider=provider)
+    cls = LLMUnavailableError if status_code in RETRYABLE_STATUS else LLMCallError
+    return cls(
+        text, step, model, status_code=status_code, code=code, provider=provider,
+        reason=f"status {status_code}", retry_after=retry_after,
+    )
 
 
-def _call_error(step, model, text):
+def _call_error(step, model, text, cls=LLMCallError, reason=None):
     text = f"{text} during {step} (model={model})"
-    logger.error(text)
-    return LLMCallError(text, step, model)
+    return cls(text, step, model, reason=reason)
 
 
-def _request_json(client, model, system_prompt, response, step):
+def _attempt(client, model, system_prompt, response, step, timeout, extra_body):
+    """Make one OpenRouter call and return the stripped message content.
+
+    Raises LLMCallError; LLMTimeoutError and LLMUnavailableError mark failures
+    worth retrying.
+    """
     try:
-        result = client.chat.completions.create(
+        result = client.with_options(timeout=timeout).chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": response},
             ],
             response_format={"type": "json_object"},
-            # Only route to OpenRouter endpoints with Zero Data Retention policies
-            extra_body={"provider": {"zdr": True}},
+            extra_body=extra_body,
         )
     # APITimeoutError subclasses APIConnectionError, so it must come first.
     except openai.APITimeoutError as e:
         raise _call_error(
-            step, model, f"OpenRouter request timed out after {LLM_REQUEST_TIMEOUT_SECONDS:g}s"
+            step, model, f"OpenRouter request timed out after {timeout:.3g}s",
+            LLMTimeoutError, f"timeout after {timeout:.3g}s",
         ) from e
     except openai.APIConnectionError as e:
-        raise _call_error(step, model, f"Could not connect to OpenRouter: {e}") from e
+        raise _call_error(
+            step, model, f"Could not connect to OpenRouter: {e}",
+            LLMUnavailableError, "connection error",
+        ) from e
     except openai.APIStatusError as e:
-        raise _status_error(step, model, e.status_code, e.body) from e
+        raise _status_error(
+            step, model, e.status_code, e.body, _retry_after_seconds(e.response)
+        ) from e
 
     # OpenRouter can report a provider failure inside a 200 response.
     body_error = getattr(result, "error", None)
@@ -186,10 +229,15 @@ def _request_json(client, model, system_prompt, response, step):
         raise _status_error(step, model, None, body_error)
 
     if not result.choices:
-        raise _call_error(step, model, "OpenRouter returned no choices")
+        raise _call_error(
+            step, model, "OpenRouter returned no choices", LLMUnavailableError, "no choices"
+        )
     choice = result.choices[0]
     if choice.finish_reason == "error":
-        raise _call_error(step, model, "The model provider reported an error mid-generation")
+        raise _call_error(
+            step, model, "The model provider reported an error mid-generation",
+            LLMUnavailableError, "finish_reason=error",
+        )
     if choice.finish_reason == "content_filter":
         raise _call_error(step, model, "The model's output was blocked by a content filter")
 
@@ -199,16 +247,87 @@ def _request_json(client, model, system_prompt, response, step):
         raise _call_error(
             step, model, f"OpenRouter returned an empty response (finish_reason={choice.finish_reason})"
         )
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        logger.error("failed to parse %s result as JSON", step)
+    return raw
+
+
+def _retry_wait(error, attempt, deadline):
+    """Seconds to wait before retrying after error, or None to give up."""
+    if not isinstance(error, (LLMTimeoutError, LLMUnavailableError)):
         return None
+    if attempt >= LLM_MAX_ATTEMPTS:
+        return None
+    wait = LLM_RETRY_BACKOFF_SECONDS if error.retry_after is None else error.retry_after
+    if deadline - time.monotonic() - wait < LLM_MIN_ATTEMPT_SECONDS:
+        return None
+    return wait
 
 
-def check_moderation(client, model, moderation_prompt, response):
+def _request_json(client, model, system_prompt, response, step, deadline, extra_body):
+    """Call OpenRouter, retrying transient failures while the eval deadline allows.
+
+    Returns the parsed JSON, or None if the model's output is not valid JSON.
+    Logs only the step, timings and error descriptions - never the prompt,
+    the submission or the model's output.
+    """
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining < LLM_MIN_ATTEMPT_SECONDS:
+            error = _call_error(
+                step, model, f"Eval deadline reached with {max(remaining, 0):.1f}s left",
+                LLMTimeoutError, "deadline",
+            )
+            logger.error("%s", error)
+            raise error
+
+        started = time.monotonic()
+        try:
+            raw = _attempt(
+                client, model, system_prompt, response, step,
+                min(LLM_ATTEMPT_TIMEOUT_SECONDS, remaining), extra_body,
+            )
+        except LLMCallError as error:
+            logger.debug(
+                "%s attempt %d failed after %.2fs", step, attempt, time.monotonic() - started
+            )
+            wait = _retry_wait(error, attempt, deadline)
+            if wait is None:
+                logger.error("%s", error)
+                raise
+            logger.warning(
+                "retrying %s after %s (attempt %d/%d, %.1fs left)",
+                step, error.reason, attempt + 1, LLM_MAX_ATTEMPTS, deadline - time.monotonic(),
+            )
+            time.sleep(wait)
+            continue
+
+        logger.debug("%s attempt %d took %.2fs", step, attempt, time.monotonic() - started)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.error("failed to parse %s result as JSON", step)
+            return None
+
+
+def _extra_body(model, fallback_models):
+    # Only route to OpenRouter endpoints with Zero Data Retention policies,
+    # preferring the lowest-latency one among them.
+    extra_body = {"provider": {"zdr": True, "sort": "latency"}}
+    # OpenRouter moves to the next model only on a provider error, not on our
+    # client timeout, so this supplements the retries rather than replacing them.
+    if (
+        isinstance(fallback_models, list)
+        and fallback_models
+        and all(isinstance(m, str) for m in fallback_models)
+    ):
+        extra_body["models"] = [model, *fallback_models]
+    return extra_body
+
+
+def check_moderation(client, model, moderation_prompt, response, deadline, extra_body):
     logger.debug("running moderation check")
-    data = _request_json(client, model, moderation_prompt, response, "moderation")
+    data = _request_json(
+        client, model, moderation_prompt, response, "moderation", deadline, extra_body
+    )
     if data is None:
         return None
     try:
@@ -220,14 +339,16 @@ def check_moderation(client, model, moderation_prompt, response):
     return passes_moderation
 
 
-def check_correctness(client, model, correctness_decision, response):
+def check_correctness(client, model, correctness_decision, response, deadline, extra_body):
     logger.debug("running correctness check")
     correctness_system = (
         f"{correctness_decision}"
         ' Output your response as a JSON object with exactly 1 field: '
         '"is_correct" (boolean, true if the student response is correct, false otherwise).'
     )
-    data = _request_json(client, model, correctness_system, response, "correctness")
+    data = _request_json(
+        client, model, correctness_system, response, "correctness", deadline, extra_body
+    )
     if data is None:
         return None
     try:
@@ -239,7 +360,10 @@ def check_correctness(client, model, correctness_decision, response):
     return is_correct
 
 
-def generate_feedback(client, model, correctness_decision, feedback_guidance, is_correct, response):
+def generate_feedback(
+    client, model, correctness_decision, feedback_guidance, is_correct, response,
+    deadline, extra_body,
+):
     logger.debug("running feedback check")
     verdict_note = "correct." if is_correct else "incorrect."
     feedback_system = (
@@ -247,7 +371,9 @@ def generate_feedback(client, model, correctness_decision, feedback_guidance, is
         ' Output your response as a JSON object with exactly 1 field: '
         '"feedback" (string, feedback for the student).'
     )
-    data = _request_json(client, model, feedback_system, response, "feedback")
+    data = _request_json(
+        client, model, feedback_system, response, "feedback", deadline, extra_body
+    )
     if data is None:
         return FALLBACK_FEEDBACK
     try:
@@ -343,20 +469,22 @@ def evaluation_function(
     to output the evaluation response.
     """
 
+    deadline = time.monotonic() + EVAL_DEADLINE_SECONDS
     answer = _answer_code(answer)
     response, _ = _resolve_submission(response, params)
 
     client = OpenAI(
         api_key=os.environ.get("OPENROUTER_API_KEY"),
         base_url="https://openrouter.ai/api/v1",
-        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
-        max_retries=LLM_MAX_RETRIES,
+        timeout=LLM_ATTEMPT_TIMEOUT_SECONDS,
+        max_retries=0,
     )
 
     try:
         context = params.get("context")
         model = params.get('model', DEFAULT_MODEL)
         logger.debug("model=%r", model)
+        extra_body = _extra_body(model, params.get("fallback_models"))
 
         correctness_decision_raw = params.get(
             'correctness_decision', default_correctness_decision(context)
@@ -377,23 +505,42 @@ def evaluation_function(
         )
         include_feedback = bool(feedback_guidance_raw.strip())
 
-        passes_moderation = check_moderation(client, model, moderation_prompt, response)
+        # Moderation and correctness run in parallel on the shared (thread-safe)
+        # client. Leaving the with block waits for both, so no request is still
+        # in flight when the client is closed.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            moderation_future = pool.submit(
+                check_moderation, client, model, moderation_prompt, response, deadline, extra_body
+            )
+            correctness_future = pool.submit(
+                check_correctness, client, model, correctness_decision, response, deadline, extra_body
+            )
+
+        # A response that hasn't passed moderation can't be graded, so its
+        # outcome (including an error) takes precedence over correctness.
+        passes_moderation = moderation_future.result()
         if passes_moderation is None:
             return _failure_result(FALLBACK_FEEDBACK, include_feedback)
         if not passes_moderation:
             logger.debug("response failed moderation")
             return _failure_result("Response did not pass moderation.", include_feedback)
 
-        is_correct = check_correctness(client, model, correctness_decision, response)
+        is_correct = correctness_future.result()
         if is_correct is None:
             return _failure_result(FALLBACK_FEEDBACK, include_feedback)
 
         if not include_feedback:
             return Result(is_correct=is_correct)
 
-        feedback_text = generate_feedback(
-            client, model, correctness_decision, feedback_guidance, is_correct, response
-        )
+        try:
+            feedback_text = generate_feedback(
+                client, model, correctness_decision, feedback_guidance, is_correct, response,
+                deadline, extra_body,
+            )
+        except LLMCallError as e:
+            # The grade is already known; don't throw it away over feedback.
+            logger.warning("feedback failed, keeping is_correct: %s", e)
+            feedback_text = FALLBACK_FEEDBACK
         result = Result(is_correct=is_correct)
         result.add_feedback("feedback", feedback_text)
         return result

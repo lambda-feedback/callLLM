@@ -4,17 +4,23 @@ An evaluation function for [Lambda Feedback](https://lambdafeedback.com) that us
 
 ## How It Works
 
-Each evaluation runs up to **three sequential** LLM calls using the model specified in `configuration.params.model`:
+Each evaluation runs up to three LLM calls using the model specified in `configuration.params.model`. Moderation and correctness run in parallel; feedback runs after both:
 
-1. **Moderation** — checks the student response for prompt-injection or manipulation attempts. The model returns a JSON object with a single `passes_moderation` boolean. If it is `false`, evaluation short-circuits immediately: the response is marked incorrect and returned with the fixed message `"Response did not pass moderation."`, and the calls below are skipped entirely.
-2. **Correctness** — only runs if moderation passed. Judges whether the response is correct given the question and answer. The model returns a JSON object with a single `is_correct` boolean.
-3. **Feedback** — only runs if correctness succeeded and `feedback_guidance` is non-empty. Generates constructive feedback for the student. This call is told the correctness verdict from step 2 (via a note appended to `correctness_decision`), so it can tailor its feedback accordingly. The model returns a JSON object with a single `feedback` string.
+1. **Moderation** — checks the student response for prompt-injection or manipulation attempts. The model returns a JSON object with a single `passes_moderation` boolean. If it is `false`, the response is marked incorrect and returned with the fixed message `"Response did not pass moderation."`; the correctness result is discarded and feedback is skipped.
+2. **Correctness** — judges whether the response is correct given the question and answer. The model returns a JSON object with a single `is_correct` boolean. Its result is only used if moderation passed.
+3. **Feedback** — only runs if correctness succeeded and `feedback_guidance` is non-empty. Generates constructive feedback for the student. This call is told the correctness verdict from step 2 (via a note appended to `correctness_decision`), so it can tailor its feedback accordingly. The model returns a JSON object with a single `feedback` string. If this call fails, the correctness verdict is still returned, with a generic "please try again" feedback message.
 
-Splitting these into separate calls means clearly manipulative submissions never pay for a correctness/feedback call, and correctness/feedback prompts stay focused on a single concern each. The worker's send timeout (`FUNCTION_WORKER_SEND_TIMEOUT` in the `Dockerfile`) is set to `120s` to give the three sequential calls enough headroom.
+Splitting these into separate calls keeps each prompt focused on a single concern.
+
+### Timeouts and retries
+
+All calls in one evaluation share a 22s deadline, 3s under the worker's send timeout (`FUNCTION_WORKER_SEND_TIMEOUT=25s` in the `Dockerfile`), which in turn sits inside API Gateway's ~29s limit. Each attempt is capped at 8s, and a timeout, connection error, 408, 429 or 5xx is retried once if at least 2s of the deadline would remain. Other errors (400, 401, 402, 403, 404, content filter) are not retried.
+
+Logs record only the step, attempt timings and error descriptions — never the student's response, the answer, the prompts or the generated feedback.
 
 ### Zero Data Retention
 
-Every LLM call sets OpenRouter's `provider.zdr` preference, so requests are only routed to [Zero Data Retention](https://openrouter.ai/docs/features/zdr) endpoints — providers that do not store prompts or completions. A model with no ZDR endpoint cannot be used: its requests fail rather than falling back to a provider that retains data. See [Model Examples](#model-examples) for how to check a model.
+Every LLM call sets OpenRouter's `provider.zdr` preference, so requests are only routed to [Zero Data Retention](https://openrouter.ai/docs/features/zdr) endpoints — providers that do not store prompts or completions. A model with no ZDR endpoint cannot be used: its requests fail rather than falling back to a provider that retains data. See [Model Examples](#model-examples) for how to check a model. Among ZDR endpoints, the lowest-latency provider is preferred (`provider.sort: "latency"`).
 
 ## Configuration
 
@@ -44,6 +50,7 @@ Requests are sent to `POST /evaluate` in µEd format.
 | `configuration.params.feedback_guidance` | no | Guidance for feedback generation. Falls back to a generic constructive-feedback prompt if omitted; pass `""` to skip feedback entirely |
 | `configuration.params.context` | no | Question/purpose text; injected into prompts via `{{context}}` |
 | `configuration.params.moderation_prompt` | no | Overrides the default moderation prompt |
+| `configuration.params.fallback_models` | no | List of OpenRouter model IDs to try, in order, if the primary model's provider returns an error. Each must have a ZDR endpoint |
 
 ### Prompt Template Variables
 
