@@ -214,6 +214,22 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
         self.assertEqual(len(fake.all_calls()), 2)
 
+    def test_json_in_code_fence_or_text_is_parsed(self):
+        # Claude models tend to wrap JSON in a Markdown fence despite json_object.
+        for wrapped in (f"```json\n{CORRECT}\n```", f"Here you go: {CORRECT}"):
+            with self.subTest(wrapped=wrapped):
+                with _openrouter([MOD_PASS], [wrapped], [FEEDBACK]):
+                    result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
+
+                self.assertTrue(result["is_correct"])
+
+    def test_json_that_is_not_an_object_is_a_parse_failure(self):
+        with _openrouter([MOD_PASS], ["true"]):
+            result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
+
     def test_moderation_parse_failure(self):
         with _openrouter(["not json"], [CORRECT]):
             result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
@@ -437,9 +453,21 @@ class TestRetries(unittest.TestCase):
             [c["model"] for c in fake.calls["moderation"]], MODEL_TIERS["small"]["models"]
         )
 
+    def test_invalid_model_id_falls_back(self):
+        # What OpenRouter returns for an unknown or retired model ID.
+        params = {**BASE_PARAMS, "model": "openai/retired", "fallback_models": ["x/backup"]}
+        error = _status_error(400, {"code": 400, "message": "openai/retired is not a valid model ID"})
+        with _openrouter([error, MOD_PASS], [error, CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["correctness"]], ["openai/retired", "x/backup"]
+        )
+
     def test_other_errors_do_not_fall_back(self):
         params = {**BASE_PARAMS, "model": "small"}
-        for status in (400, 401, 402, 403):
+        for status in (401, 402, 403):
             with self.subTest(status=status):
                 error = _status_error(status, {"code": status, "message": "nope"})
                 with _openrouter([error, MOD_PASS], [CORRECT]) as fake:
@@ -447,6 +475,33 @@ class TestRetries(unittest.TestCase):
                         evaluation_function("Paris", "Paris", params)
 
                 self.assertEqual(len(fake.calls["moderation"]), 1)
+
+    def test_content_filter_does_not_fall_back(self):
+        params = {**BASE_PARAMS, "model": "small"}
+        with _openrouter([_content_filter_error()], [CORRECT]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(len(fake.calls["moderation"]), 1)
+
+    def test_unparseable_json_falls_back(self):
+        params = {**BASE_PARAMS, "model": "large"}
+        with _openrouter([MOD_PASS], ["not json", CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["correctness"]], MODEL_TIERS["large"]["models"]
+        )
+
+    def test_unparseable_json_from_every_model(self):
+        params = {**BASE_PARAMS, "model": "large"}
+        with _openrouter([MOD_PASS], ["not json", "still not json"]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
+        self.assertEqual(len(fake.calls["correctness"]), 2)
 
     def test_every_model_tried_while_time_allows(self):
         params = {**BASE_PARAMS, "model": "large", "fallback_models": ["x/backup"]}

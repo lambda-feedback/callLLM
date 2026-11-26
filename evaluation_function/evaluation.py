@@ -349,8 +349,11 @@ def _retry_wait(error, attempt, max_attempts, deadline, switching):
     switching is whether the next attempt uses a different model.
     """
     retryable = isinstance(error, (LLMTimeoutError, LLMUnavailableError))
-    # A missing model (e.g. one that has been retired) is worth replacing.
-    if not retryable and not (switching and error.status_code == 404):
+    # A model OpenRouter rejects (an invalid or retired ID is a 400 "not a
+    # valid model ID", or a 404) may be fine to replace with the next one; a
+    # submission blocked by a content filter is not the model's fault.
+    model_rejected = error.status_code in (400, 404) and not _is_input_content_filter(error)
+    if not retryable and not (switching and model_rejected):
         return None
     if attempt >= max_attempts:
         return None
@@ -369,9 +372,10 @@ def _request_json(client, models, system_prompt, response, step, deadline, extra
 
     Each retry moves to the next of models (the last is reused once they run
     out), so the fallbacks are tried after a timeout or provider error on the
-    primary, or if the primary no longer exists.
+    primary, if OpenRouter rejects the primary (e.g. a retired model ID), or
+    if its output isn't valid JSON.
 
-    Returns the parsed JSON, or None if the model's output is not valid JSON.
+    Returns the parsed JSON object, or None if no model gave valid JSON.
     Logs only the step, timings and error descriptions - never the prompt,
     the submission or the model's output.
     """
@@ -414,11 +418,39 @@ def _request_json(client, models, system_prompt, response, step, deadline, extra
             continue
 
         logger.debug("%s attempt %d took %.2fs", step, attempt, time.monotonic() - started)
+        data = _parse_json(raw)
+        if data is not None:
+            return data
+        # Only whether the output was fenced is logged, never its content.
+        fenced = raw.startswith("```")
+        if (
+            next_model != model
+            and attempt < max_attempts
+            and deadline - time.monotonic() >= LLM_MIN_ATTEMPT_SECONDS
+        ):
+            logger.warning(
+                "retrying %s with %s after unparseable JSON from %s (fenced=%s, attempt %d/%d)",
+                step, next_model, model, fenced, attempt + 1, max_attempts,
+            )
+            continue
+        logger.error("failed to parse %s result as JSON (model=%s, fenced=%s)", step, model, fenced)
+        return None
+
+
+def _parse_json(raw):
+    """Parse a model's output as a JSON object, or return None.
+
+    Tolerates a Markdown code fence or other text around the object, which
+    some models (e.g. Claude) add despite response_format=json_object.
+    """
+    for candidate in (raw, raw[raw.find("{"):raw.rfind("}") + 1]):
         try:
-            return json.loads(raw)
+            data = json.loads(candidate)
         except json.JSONDecodeError:
-            logger.error("failed to parse %s result as JSON", step)
-            return None
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def _extra_body(reasoning=None):
