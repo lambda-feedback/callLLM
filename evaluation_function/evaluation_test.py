@@ -20,6 +20,7 @@ from .evaluation import (
     LLMUnavailableError,
     evaluation_function,
 )
+from .models import DEFAULT_TIER, MODEL_TIERS, PROVIDER_TIERS
 
 BASE_PARAMS = {
     "model": "openai/gpt-4o-mini",
@@ -213,6 +214,22 @@ class TestEvaluationFunction(unittest.TestCase):
         self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
         self.assertEqual(len(fake.all_calls()), 2)
 
+    def test_json_in_code_fence_or_text_is_parsed(self):
+        # Claude models tend to wrap JSON in a Markdown fence despite json_object.
+        for wrapped in (f"```json\n{CORRECT}\n```", f"Here you go: {CORRECT}"):
+            with self.subTest(wrapped=wrapped):
+                with _openrouter([MOD_PASS], [wrapped], [FEEDBACK]):
+                    result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
+
+                self.assertTrue(result["is_correct"])
+
+    def test_json_that_is_not_an_object_is_a_parse_failure(self):
+        with _openrouter([MOD_PASS], ["true"]):
+            result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
+
     def test_moderation_parse_failure(self):
         with _openrouter(["not json"], [CORRECT]):
             result = evaluation_function("Paris", "Paris", BASE_PARAMS).to_dict()
@@ -299,7 +316,54 @@ class TestEvaluationFunction(unittest.TestCase):
             evaluation_function("Paris", "Paris", params)
 
         for call in fake.all_calls():
-            self.assertEqual(call["model"], "openai/gpt-4o-mini")
+            self.assertEqual(call["model"], MODEL_TIERS[DEFAULT_TIER]["models"][0])
+
+    def test_model_tier_uses_its_primary_model(self):
+        params = {**BASE_PARAMS, "model": "large"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], MODEL_TIERS["large"]["models"][0])
+            self.assertEqual(
+                call["extra_body"], {"provider": {"zdr": True, "sort": "latency"}}
+            )
+
+    def test_reasoning_tier_requests_reasoning(self):
+        params = {**BASE_PARAMS, "model": "reasoning"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        tier = MODEL_TIERS["reasoning"]
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], tier["models"][0])
+            self.assertEqual(call["extra_body"]["reasoning"], tier["reasoning"])
+
+    def test_provider_tier_uses_that_providers_model(self):
+        params = {**BASE_PARAMS, "model": "medium", "provider": "anthropic"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], PROVIDER_TIERS["anthropic"]["medium"]["models"][0])
+            self.assertNotIn("reasoning", call["extra_body"])
+
+    def test_provider_reasoning_tier_requests_reasoning(self):
+        params = {**BASE_PARAMS, "model": "reasoning", "provider": "google"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        tier = PROVIDER_TIERS["google"]["reasoning"]
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], tier["models"][0])
+            self.assertEqual(call["extra_body"]["reasoning"], tier["reasoning"])
+
+    def test_unknown_provider_raises(self):
+        params = {**BASE_PARAMS, "model": "medium", "provider": "acme"}
+        with _openrouter([], [], []) as fake:
+            with self.assertRaises(ValueError):
+                evaluation_function("Paris", "Paris", params)
+        self.assertEqual(fake.all_calls(), [])
 
     def test_requests_zero_data_retention_and_low_latency(self):
         with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
@@ -310,25 +374,25 @@ class TestEvaluationFunction(unittest.TestCase):
                 call["extra_body"], {"provider": {"zdr": True, "sort": "latency"}}
             )
 
-    def test_fallback_models(self):
-        params = {**BASE_PARAMS, "fallback_models": ["anthropic/claude-haiku-5-5"]}
+    def test_fallback_models_unused_when_primary_succeeds(self):
+        params = {**BASE_PARAMS, "fallback_models": ["anthropic/claude-haiku-5.5"]}
         with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
             evaluation_function("Paris", "Paris", params)
 
         for call in fake.all_calls():
-            self.assertEqual(
-                call["extra_body"]["models"],
-                ["openai/gpt-4o-mini", "anthropic/claude-haiku-5-5"],
-            )
-            self.assertTrue(call["extra_body"]["provider"]["zdr"])
+            self.assertEqual(call["model"], "openai/gpt-4o-mini")
+            self.assertNotIn("models", call["extra_body"])
 
     def test_invalid_fallback_models_ignored(self):
-        params = {**BASE_PARAMS, "fallback_models": "anthropic/claude-haiku-5-5"}
-        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+        params = {**BASE_PARAMS, "fallback_models": "anthropic/claude-haiku-5.5"}
+        with _openrouter([_timeout(), MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
             evaluation_function("Paris", "Paris", params)
 
-        for call in fake.all_calls():
-            self.assertNotIn("models", call["extra_body"])
+        # The retry reuses the primary, as there is no valid fallback.
+        self.assertEqual(
+            [c["model"] for c in fake.calls["moderation"]],
+            ["openai/gpt-4o-mini", "openai/gpt-4o-mini"],
+        )
 
     def test_default_correctness_decision_without_context(self):
         params = {"model": "openai/gpt-4o-mini"}
@@ -375,9 +439,115 @@ class TestRetries(unittest.TestCase):
                 evaluation_function("Paris", "Paris", BASE_PARAMS)
 
         self.assertTrue(
-            any("retrying moderation after timeout after 8s (attempt 2/2" in line
+            any("retrying moderation with openai/gpt-4o-mini after timeout after 8s "
+                "from openai/gpt-4o-mini (attempt 2/2" in line
                 for line in logs.output)
         )
+
+    def test_timeout_retries_with_fallback_model(self):
+        params = {**BASE_PARAMS, "model": "medium"}
+        with _openrouter([_timeout(), MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["moderation"]], MODEL_TIERS["medium"]["models"]
+        )
+        # The other steps weren't affected, so they stay on the primary.
+        self.assertEqual(fake.calls["correctness"][0]["model"], MODEL_TIERS["medium"]["models"][0])
+
+    def test_provider_error_retries_with_fallback_model(self):
+        params = {**BASE_PARAMS, "fallback_models": ["anthropic/claude-haiku-5.5"]}
+        error = _status_error(502, {"code": 502, "message": "down"})
+        with _openrouter([error, MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        self.assertEqual(
+            [c["model"] for c in fake.calls["moderation"]],
+            ["openai/gpt-4o-mini", "anthropic/claude-haiku-5.5"],
+        )
+
+    def test_missing_model_falls_back(self):
+        # e.g. a tier's primary model has been retired.
+        params = {**BASE_PARAMS, "model": "small"}
+        error = _status_error(404, {"code": 404, "message": "No endpoints found"})
+        with _openrouter([error, MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["moderation"]], MODEL_TIERS["small"]["models"]
+        )
+
+    def test_invalid_model_id_falls_back(self):
+        # What OpenRouter returns for an unknown or retired model ID.
+        params = {**BASE_PARAMS, "model": "openai/retired", "fallback_models": ["x/backup"]}
+        error = _status_error(400, {"code": 400, "message": "openai/retired is not a valid model ID"})
+        with _openrouter([error, MOD_PASS], [error, CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["correctness"]], ["openai/retired", "x/backup"]
+        )
+
+    def test_other_errors_do_not_fall_back(self):
+        params = {**BASE_PARAMS, "model": "small"}
+        for status in (401, 402, 403):
+            with self.subTest(status=status):
+                error = _status_error(status, {"code": status, "message": "nope"})
+                with _openrouter([error, MOD_PASS], [CORRECT]) as fake:
+                    with self.assertRaises(LLMCallError):
+                        evaluation_function("Paris", "Paris", params)
+
+                self.assertEqual(len(fake.calls["moderation"]), 1)
+
+    def test_content_filter_does_not_fall_back(self):
+        params = {**BASE_PARAMS, "model": "small"}
+        with _openrouter([_content_filter_error()], [CORRECT]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(len(fake.calls["moderation"]), 1)
+
+    def test_unparseable_json_falls_back(self):
+        params = {**BASE_PARAMS, "model": "large"}
+        with _openrouter([MOD_PASS], ["not json", CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(
+            [c["model"] for c in fake.calls["correctness"]], MODEL_TIERS["large"]["models"]
+        )
+
+    def test_unparseable_json_from_every_model(self):
+        params = {**BASE_PARAMS, "model": "large"}
+        with _openrouter([MOD_PASS], ["not json", "still not json"]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertFalse(result["is_correct"])
+        self.assertEqual(result["feedback"], FALLBACK_FEEDBACK)
+        self.assertEqual(len(fake.calls["correctness"]), 2)
+
+    def test_every_model_tried_while_time_allows(self):
+        params = {**BASE_PARAMS, "model": "large", "fallback_models": ["x/backup"]}
+        models = [*MODEL_TIERS["large"]["models"], "x/backup"]
+        with _openrouter([_timeout(), _timeout(), MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual([c["model"] for c in fake.calls["moderation"]], models)
+
+    def test_retry_after_ignored_when_switching_model(self):
+        params = {**BASE_PARAMS, "fallback_models": ["anthropic/claude-haiku-5.5"]}
+        error = _status_error(429, {"code": 429, "message": "slow down"}, {"Retry-After": "30"})
+        with _openrouter([error, MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            result = evaluation_function("Paris", "Paris", params).to_dict()
+            sleeps = [c.args[0] for c in evaluation.time.sleep.call_args_list]
+
+        self.assertTrue(result["is_correct"])
+        self.assertEqual(fake.calls["moderation"][1]["model"], "anthropic/claude-haiku-5.5")
+        self.assertNotIn(30.0, sleeps)
 
     def test_no_second_attempt_without_time_left(self):
         params = {**BASE_PARAMS, "feedback_guidance": ""}

@@ -4,7 +4,7 @@ An evaluation function for [Lambda Feedback](https://lambdafeedback.com) that us
 
 ## How It Works
 
-Each evaluation runs up to three LLM calls using the model specified in `configuration.params.model`. Moderation and correctness run in parallel; feedback runs after both:
+Each evaluation runs up to three LLM calls using the model or [model tier](#model-tiers) specified in `configuration.params.model`. Moderation and correctness run in parallel; feedback runs after both:
 
 1. **Moderation** — checks the student response for prompt-injection or manipulation attempts. The model returns a JSON object with a single `passes_moderation` boolean. If it is `false`, the response is marked incorrect and returned with the fixed message `"Response did not pass moderation."`; the correctness result is discarded and feedback is skipped. If the provider's own content filter rejects the submission (a 400 with `provider_error_code: content_filter`, e.g. Azure's jailbreak filter), that also counts as failing moderation.
 2. **Correctness** — judges whether the response is correct given the question and answer. The model returns a JSON object with a single `is_correct` boolean. Its result is only used if moderation passed.
@@ -14,7 +14,7 @@ Splitting these into separate calls keeps each prompt focused on a single concer
 
 ### Timeouts and retries
 
-All calls in one evaluation share a 22s deadline, 3s under the worker's send timeout (`FUNCTION_WORKER_SEND_TIMEOUT=25s` in the `Dockerfile`), which in turn sits inside API Gateway's ~29s limit. Each attempt is capped at 8s, and a timeout, connection error, 408, 429 or 5xx is retried once if at least 2s of the deadline would remain. Other errors (400, 401, 402, 403, 404, content filter) are not retried.
+All calls in one evaluation share a 22s deadline, 3s under the worker's send timeout (`FUNCTION_WORKER_SEND_TIMEOUT=25s` in the `Dockerfile`), which in turn sits inside API Gateway's ~29s limit. Each attempt is capped at 8s. A timeout, connection error, 408, 429 or 5xx is retried if at least 2s of the deadline would remain. Each retry moves to the next fallback model (a tier's built-in fallback, then any `fallback_models`), reusing the last model once they run out. Each step gets at least two attempts and can try every model in the list if time allows. If there is a next model, a 400 or 404 (e.g. OpenRouter's "not a valid model ID" for a retired model) or output that isn't valid JSON also moves on to it. Other errors (401, 402, 403, content filter) are not retried. JSON wrapped in a Markdown code fence or surrounded by text is accepted, since Claude models tend to add one despite `response_format`. Fallbacks are handled here rather than by OpenRouter's `models` field, because OpenRouter only falls back on errors it sees and never on our own 8s timeout.
 
 Logs record only the step, attempt timings and error descriptions — never the student's response, the answer, the prompts or the generated feedback.
 
@@ -45,12 +45,13 @@ Requests are sent to `POST /evaluate` in µEd format.
 | `submission.type` | yes | Artefact type: `TEXT`, `CODE`, `MATH`, `MODEL` |
 | `submission.content.text` | yes (TEXT) | The student's response |
 | `task.referenceSolution.text` | yes | The reference answer (may be empty string) |
-| `configuration.params.model` | no | OpenRouter model ID; must have a ZDR endpoint. Defaults to `openai/gpt-4o-mini` if omitted |
+| `configuration.params.model` | no | A [model tier](#model-tiers) (`small`, `medium`, `large`, `reasoning`) or an OpenRouter model ID with a ZDR endpoint. Defaults to the `medium` tier if omitted |
+| `configuration.params.provider` | no | With a tier `model`, use that provider's version of the tier instead: `openai`, `google`, `anthropic` or `deepseek` (see [Provider tiers](#provider-tiers)). Ignored for explicit model IDs. An unknown provider is a configuration error |
 | `configuration.params.correctness_decision` | no | Describes the evaluation criteria used to decide correctness. Falls back to a generic "compare response to answer" prompt if omitted (the fallback adapts depending on whether `context` is also provided) |
 | `configuration.params.feedback_guidance` | no | Guidance for feedback generation. Falls back to a generic constructive-feedback prompt if omitted; pass `""` to skip feedback entirely |
 | `configuration.params.context` | no | Question/purpose text; injected into prompts via `{{context}}` |
 | `configuration.params.moderation_prompt` | no | Overrides the default moderation prompt |
-| `configuration.params.fallback_models` | no | List of OpenRouter model IDs to try, in order, if the primary model's provider returns an error. Each must have a ZDR endpoint |
+| `configuration.params.fallback_models` | no | List of OpenRouter model IDs to try, in order, if the primary model times out, errors or doesn't exist (see [Timeouts and retries](#timeouts-and-retries)). Each must have a ZDR endpoint. When `model` is a tier, these come after the tier's built-in fallbacks |
 
 ### Prompt Template Variables
 
@@ -97,7 +98,7 @@ Returns an array with one feedback object:
   },
   "configuration": {
     "params": {
-      "model": "openai/gpt-4o-mini",
+      "model": "small",
       "correctness_decision": "The student must identify a risk and explain how it can cause harm.",
       "feedback_guidance": ""
     }
@@ -211,6 +212,42 @@ Returns an array with one feedback object:
 }
 ```
 
+## Model Tiers
+
+Instead of a specific model ID, `model` can be a tier name. A tier stands for a capability level, and this repo decides which models sit behind it, so tasks keep working when a model is retired.
+
+| Tier | Primary model | Built-in fallback | Notes |
+|------|---------------|-------------------|-------|
+| `small` | `openai/gpt-6-luna` | `anthropic/claude-haiku-5.5` | Fastest and cheapest |
+| `medium` | `google/gemini-3.8-flash` | `openai/gpt-6.1-terra` | Default when `model` is omitted |
+| `large` | `anthropic/claude-sonnet-5.5` | `openai/gpt-6.2-sol` | Strongest general-purpose models |
+| `reasoning` | `openai/gpt-6.2-sol` | `anthropic/claude-sonnet-5.5` | Sends `reasoning: {"effort": "low"}` |
+
+If the primary model times out, returns a retryable error or no longer exists, the next attempt uses the built-in fallback. Any `fallback_models` you pass are tried after it.
+
+### Provider tiers
+
+Models from different providers give noticeably different feedback. To keep one provider's style, set `provider` alongside a tier name, e.g. `{"model": "medium", "provider": "openai"}`. A provider tier's fallback comes from **the same provider**, so feedback stays consistent, but an outage at that provider fails the evaluation unless you also pass `fallback_models`.
+
+| Provider | `small` | `medium` | `large` | `reasoning` (effort low) |
+|----------|---------|----------|---------|--------------------------|
+| `openai` | `gpt-6-luna` → `gpt-5.6-luna` | `gpt-6.1-terra` → `gpt-5.6-terra` | `gpt-6.2-sol` → `gpt-6.1-sol` | `gpt-6.2-sol` → `gpt-6.1-sol` |
+| `google` | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` | `gemini-3.8-flash` → `gemini-3.7-flash` | `gemini-4-carbon` → `gemini-4-hydrogen` | `gemini-4-argon` → `gemini-4-carbon` |
+| `anthropic` | `claude-haiku-5.5` → `claude-haiku-4.5` | `claude-sonnet-5.5` → `claude-sonnet-5` | `claude-opus-5.5` → `claude-opus-5` | `claude-sonnet-5.5` → `claude-sonnet-5` |
+| `deepseek` | `deepseek-v4.1-flash` → `deepseek-v4-flash` | `deepseek-v4-pro-0813` → `deepseek-v4-pro` | `deepseek-v4-pro-0813` → `deepseek-v4-pro` | `deepseek-v4-pro-0813` → `deepseek-r1-0528` |
+
+Each ID is prefixed with the provider (e.g. `openai/gpt-6-luna`). DeepSeek has no model above V4 Pro, so its `large` repeats `medium`. Provider names must be exact and lowercase.
+
+### Updating a tier
+
+The tiers are defined in [`evaluation_function/models.py`](evaluation_function/models.py). To replace a retired model, edit `MODEL_TIERS` or `PROVIDER_TIERS` and redeploy. Every model must have a ZDR endpoint that supports `response_format`. In `MODEL_TIERS`, each tier's fallback should come from a different provider than its primary; in `PROVIDER_TIERS`, every model must come from that provider (a test enforces this). To add a provider, add a key to `PROVIDER_TIERS` covering every tier. To check all tiers against OpenRouter's live ZDR list:
+
+```bash
+CHECK_MODEL_TIERS_ZDR=1 poetry run pytest evaluation_function/models_test.py -k zdr
+```
+
+Also update the table above.
+
 ## Model Examples
 
 Models are specified as OpenRouter IDs in the format `provider/model-name`. See the full list at [openrouter.ai/models](https://openrouter.ai/models).
@@ -220,7 +257,7 @@ Because every call requires [Zero Data Retention](#zero-data-retention), the mod
 | Provider | Model ID | Notes |
 |----------|----------|-------|
 | OpenAI | `openai/gpt-4o` | Strong general-purpose option |
-| OpenAI | `openai/gpt-4o-mini` | Fast and cheap; good default |
+| OpenAI | `openai/gpt-4o-mini` | Fast and cheap |
 | Anthropic | `anthropic/claude-sonnet-5` | Strong reasoning |
 | Anthropic | `anthropic/claude-haiku-4.5` | Fast Anthropic option |
 | Google | `google/gemini-3.5-flash` | Very fast and low cost |
@@ -249,6 +286,8 @@ curl -s https://openrouter.ai/api/v1/endpoints/zdr | jq -r '.data[].model_id' | 
 ```
 evaluation_function/main.py             # entrypoint — starts the RPC server
 evaluation_function/evaluation.py       # evaluation logic
+evaluation_function/models.py           # model tier definitions
+evaluation_function/models_test.py      # model tier tests
 evaluation_function/preview.py          # preview logic
 evaluation_function/evaluation_test.py  # evaluation tests
 evaluation_function/preview_test.py     # preview tests
