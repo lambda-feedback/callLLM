@@ -20,7 +20,7 @@ from .evaluation import (
     LLMUnavailableError,
     evaluation_function,
 )
-from .models import DEFAULT_TIER, MODEL_TIERS
+from .models import DEFAULT_TIER, MODEL_TIERS, PROVIDER_TIERS
 
 BASE_PARAMS = {
     "model": "openai/gpt-4o-mini",
@@ -338,6 +338,32 @@ class TestEvaluationFunction(unittest.TestCase):
         for call in fake.all_calls():
             self.assertEqual(call["model"], tier["models"][0])
             self.assertEqual(call["extra_body"]["reasoning"], tier["reasoning"])
+
+    def test_provider_tier_uses_that_providers_model(self):
+        params = {**BASE_PARAMS, "model": "medium", "provider": "anthropic"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], PROVIDER_TIERS["anthropic"]["medium"]["models"][0])
+            self.assertNotIn("reasoning", call["extra_body"])
+
+    def test_provider_reasoning_tier_requests_reasoning(self):
+        params = {**BASE_PARAMS, "model": "reasoning", "provider": "google"}
+        with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:
+            evaluation_function("Paris", "Paris", params)
+
+        tier = PROVIDER_TIERS["google"]["reasoning"]
+        for call in fake.all_calls():
+            self.assertEqual(call["model"], tier["models"][0])
+            self.assertEqual(call["extra_body"]["reasoning"], tier["reasoning"])
+
+    def test_unknown_provider_raises(self):
+        params = {**BASE_PARAMS, "model": "medium", "provider": "acme"}
+        with _openrouter([], [], []) as fake:
+            with self.assertRaises(ValueError):
+                evaluation_function("Paris", "Paris", params)
+        self.assertEqual(fake.all_calls(), [])
 
     def test_requests_zero_data_retention_and_low_latency(self):
         with _openrouter([MOD_PASS], [CORRECT], [FEEDBACK]) as fake:

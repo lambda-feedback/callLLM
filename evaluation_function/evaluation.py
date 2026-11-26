@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from lf_toolkit import EvaluationFunctionError, UpstreamTimeoutError, UpstreamUnavailableError
 from lf_toolkit.evaluation import Result, Params
 
-from .models import DEFAULT_TIER, MODEL_TIERS, resolve_models
+from .models import DEFAULT_TIER, get_tier, resolve_models
 
 load_dotenv()
 
@@ -637,9 +637,11 @@ def evaluation_function(
     try:
         context = params.get("context")
         requested = params.get("model", DEFAULT_TIER)
-        models = resolve_models(requested, params.get("fallback_models"))
-        logger.debug("model=%r -> %s", requested, models)
-        extra_body = _extra_body(MODEL_TIERS.get(requested, {}).get("reasoning"))
+        provider = params.get("provider")
+        tier = get_tier(requested, provider) or {}
+        models = resolve_models(requested, params.get("fallback_models"), provider)
+        logger.debug("model=%r provider=%r -> %s", requested, provider, models)
+        extra_body = _extra_body(tier.get("reasoning"))
 
         correctness_decision_raw = params.get(
             'correctness_decision', default_correctness_decision(context)

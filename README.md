@@ -46,6 +46,7 @@ Requests are sent to `POST /evaluate` in µEd format.
 | `submission.content.text` | yes (TEXT) | The student's response |
 | `task.referenceSolution.text` | yes | The reference answer (may be empty string) |
 | `configuration.params.model` | no | A [model tier](#model-tiers) (`small`, `medium`, `large`, `reasoning`) or an OpenRouter model ID with a ZDR endpoint. Defaults to the `medium` tier if omitted |
+| `configuration.params.provider` | no | With a tier `model`, use that provider's version of the tier instead: `openai`, `google`, `anthropic` or `deepseek` (see [Provider tiers](#provider-tiers)). Ignored for explicit model IDs. An unknown provider is a configuration error |
 | `configuration.params.correctness_decision` | no | Describes the evaluation criteria used to decide correctness. Falls back to a generic "compare response to answer" prompt if omitted (the fallback adapts depending on whether `context` is also provided) |
 | `configuration.params.feedback_guidance` | no | Guidance for feedback generation. Falls back to a generic constructive-feedback prompt if omitted; pass `""` to skip feedback entirely |
 | `configuration.params.context` | no | Question/purpose text; injected into prompts via `{{context}}` |
@@ -224,9 +225,22 @@ Instead of a specific model ID, `model` can be a tier name. A tier stands for a 
 
 If the primary model times out, returns a retryable error or no longer exists, the next attempt uses the built-in fallback. Any `fallback_models` you pass are tried after it.
 
+### Provider tiers
+
+Models from different providers give noticeably different feedback. To keep one provider's style, set `provider` alongside a tier name, e.g. `{"model": "medium", "provider": "openai"}`. A provider tier's fallback comes from **the same provider**, so feedback stays consistent, but an outage at that provider fails the evaluation unless you also pass `fallback_models`.
+
+| Provider | `small` | `medium` | `large` | `reasoning` (effort low) |
+|----------|---------|----------|---------|--------------------------|
+| `openai` | `gpt-6-luna` → `gpt-5.6-luna` | `gpt-6.1-terra` → `gpt-5.6-terra` | `gpt-6.2-sol` → `gpt-6.1-sol` | `gpt-6.2-sol` → `gpt-6.1-sol` |
+| `google` | `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite` | `gemini-3.8-flash` → `gemini-3.7-flash` | `gemini-4-carbon` → `gemini-4-hydrogen` | `gemini-4-argon` → `gemini-4-carbon` |
+| `anthropic` | `claude-haiku-5.5` → `claude-haiku-4.5` | `claude-sonnet-5.5` → `claude-sonnet-5` | `claude-opus-5.5` → `claude-opus-5` | `claude-sonnet-5.5` → `claude-sonnet-5` |
+| `deepseek` | `deepseek-v4.1-flash` → `deepseek-v4-flash` | `deepseek-v4-pro-0813` → `deepseek-v4-pro` | `deepseek-v4-pro-0813` → `deepseek-v4-pro` | `deepseek-v4-pro-0813` → `deepseek-r1-0528` |
+
+Each ID is prefixed with the provider (e.g. `openai/gpt-6-luna`). DeepSeek has no model above V4 Pro, so its `large` repeats `medium`. Provider names must be exact and lowercase.
+
 ### Updating a tier
 
-The tiers are defined in [`evaluation_function/models.py`](evaluation_function/models.py). To replace a retired model, edit `MODEL_TIERS` and redeploy. Every model must have a ZDR endpoint that supports `response_format`, and each tier's fallback should come from a different provider than its primary. To check the current tiers against OpenRouter's live ZDR list:
+The tiers are defined in [`evaluation_function/models.py`](evaluation_function/models.py). To replace a retired model, edit `MODEL_TIERS` or `PROVIDER_TIERS` and redeploy. Every model must have a ZDR endpoint that supports `response_format`. In `MODEL_TIERS`, each tier's fallback should come from a different provider than its primary; in `PROVIDER_TIERS`, every model must come from that provider (a test enforces this). To add a provider, add a key to `PROVIDER_TIERS` covering every tier. To check all tiers against OpenRouter's live ZDR list:
 
 ```bash
 CHECK_MODEL_TIERS_ZDR=1 poetry run pytest evaluation_function/models_test.py -k zdr
