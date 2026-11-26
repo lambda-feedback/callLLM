@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 from lf_toolkit import EvaluationFunctionError, UpstreamTimeoutError, UpstreamUnavailableError
 from lf_toolkit.evaluation import Result, Params
 
+from .models import DEFAULT_TIER, MODEL_TIERS, resolve_models
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -24,8 +26,6 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_handler)
 logger.propagate = False
-
-DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 # Every LLM call in one eval shares a deadline, 3s under the shim's 25s worker
 # send timeout (itself inside API Gateway's ~29s), so a slow call is retried
@@ -343,26 +343,42 @@ def _attempt(client, model, system_prompt, response, step, timeout, extra_body):
     return raw
 
 
-def _retry_wait(error, attempt, deadline):
-    """Seconds to wait before retrying after error, or None to give up."""
-    if not isinstance(error, (LLMTimeoutError, LLMUnavailableError)):
+def _retry_wait(error, attempt, max_attempts, deadline, switching):
+    """Seconds to wait before retrying after error, or None to give up.
+
+    switching is whether the next attempt uses a different model.
+    """
+    retryable = isinstance(error, (LLMTimeoutError, LLMUnavailableError))
+    # A missing model (e.g. one that has been retired) is worth replacing.
+    if not retryable and not (switching and error.status_code == 404):
         return None
-    if attempt >= LLM_MAX_ATTEMPTS:
+    if attempt >= max_attempts:
         return None
-    wait = LLM_RETRY_BACKOFF_SECONDS if error.retry_after is None else error.retry_after
+    # Retry-After applies to the model that was rate limited, not the next one.
+    if switching or error.retry_after is None:
+        wait = LLM_RETRY_BACKOFF_SECONDS
+    else:
+        wait = error.retry_after
     if deadline - time.monotonic() - wait < LLM_MIN_ATTEMPT_SECONDS:
         return None
     return wait
 
 
-def _request_json(client, model, system_prompt, response, step, deadline, extra_body):
-    """Call OpenRouter, retrying transient failures while the eval deadline allows.
+def _request_json(client, models, system_prompt, response, step, deadline, extra_body):
+    """Call OpenRouter, retrying failures while the eval deadline allows.
+
+    Each retry moves to the next of models (the last is reused once they run
+    out), so the fallbacks are tried after a timeout or provider error on the
+    primary, or if the primary no longer exists.
 
     Returns the parsed JSON, or None if the model's output is not valid JSON.
     Logs only the step, timings and error descriptions - never the prompt,
     the submission or the model's output.
     """
-    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+    max_attempts = max(LLM_MAX_ATTEMPTS, len(models))
+    for attempt in range(1, max_attempts + 1):
+        model = models[min(attempt - 1, len(models) - 1)]
+        next_model = models[min(attempt, len(models) - 1)]
         remaining = deadline - time.monotonic()
         if remaining < LLM_MIN_ATTEMPT_SECONDS:
             error = _call_error(
@@ -382,7 +398,7 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
             logger.debug(
                 "%s attempt %d failed after %.2fs", step, attempt, time.monotonic() - started
             )
-            wait = _retry_wait(error, attempt, deadline)
+            wait = _retry_wait(error, attempt, max_attempts, deadline, next_model != model)
             if wait is None:
                 # A content-filtered submission is the student's doing, not a
                 # fault, so it doesn't warrant an ERROR.
@@ -390,8 +406,9 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
                 logger.log(level, "%s", error.detail)
                 raise
             logger.warning(
-                "retrying %s after %s (attempt %d/%d, %.1fs left)",
-                step, error.reason, attempt + 1, LLM_MAX_ATTEMPTS, deadline - time.monotonic(),
+                "retrying %s with %s after %s from %s (attempt %d/%d, %.1fs left)",
+                step, next_model, error.reason, model, attempt + 1, max_attempts,
+                deadline - time.monotonic(),
             )
             time.sleep(wait)
             continue
@@ -404,18 +421,14 @@ def _request_json(client, model, system_prompt, response, step, deadline, extra_
             return None
 
 
-def _extra_body(model, fallback_models):
+def _extra_body(reasoning=None):
     # Only route to OpenRouter endpoints with Zero Data Retention policies,
-    # preferring the lowest-latency one among them.
+    # preferring the lowest-latency one among them. Fallback models are tried
+    # by _request_json's retries rather than OpenRouter's `models` field, which
+    # doesn't act on our client timeout and hides which model answered.
     extra_body = {"provider": {"zdr": True, "sort": "latency"}}
-    # OpenRouter moves to the next model only on a provider error, not on our
-    # client timeout, so this supplements the retries rather than replacing them.
-    if (
-        isinstance(fallback_models, list)
-        and fallback_models
-        and all(isinstance(m, str) for m in fallback_models)
-    ):
-        extra_body["models"] = [model, *fallback_models]
+    if reasoning:
+        extra_body["reasoning"] = reasoning
     return extra_body
 
 
@@ -424,11 +437,11 @@ def _is_input_content_filter(error):
     return error.status_code == 400 and error.provider_error_code == "content_filter"
 
 
-def check_moderation(client, model, moderation_prompt, response, deadline, extra_body):
+def check_moderation(client, models, moderation_prompt, response, deadline, extra_body):
     logger.debug("running moderation check")
     try:
         data = _request_json(
-            client, model, moderation_prompt, response, "moderation", deadline, extra_body
+            client, models, moderation_prompt, response, "moderation", deadline, extra_body
         )
     except LLMCallError as e:
         # A provider that blocks the submission outright has, in effect,
@@ -448,7 +461,7 @@ def check_moderation(client, model, moderation_prompt, response, deadline, extra
     return passes_moderation
 
 
-def check_correctness(client, model, correctness_decision, response, deadline, extra_body):
+def check_correctness(client, models, correctness_decision, response, deadline, extra_body):
     logger.debug("running correctness check")
     correctness_system = (
         f"{correctness_decision}"
@@ -456,7 +469,7 @@ def check_correctness(client, model, correctness_decision, response, deadline, e
         '"is_correct" (boolean, true if the student response is correct, false otherwise).'
     )
     data = _request_json(
-        client, model, correctness_system, response, "correctness", deadline, extra_body
+        client, models, correctness_system, response, "correctness", deadline, extra_body
     )
     if data is None:
         return None
@@ -470,7 +483,7 @@ def check_correctness(client, model, correctness_decision, response, deadline, e
 
 
 def generate_feedback(
-    client, model, correctness_decision, feedback_guidance, is_correct, response,
+    client, models, correctness_decision, feedback_guidance, is_correct, response,
     deadline, extra_body,
 ):
     logger.debug("running feedback check")
@@ -481,7 +494,7 @@ def generate_feedback(
         '"feedback" (string, feedback for the student).'
     )
     data = _request_json(
-        client, model, feedback_system, response, "feedback", deadline, extra_body
+        client, models, feedback_system, response, "feedback", deadline, extra_body
     )
     if data is None:
         return FALLBACK_FEEDBACK
@@ -591,9 +604,10 @@ def evaluation_function(
 
     try:
         context = params.get("context")
-        model = params.get('model', DEFAULT_MODEL)
-        logger.debug("model=%r", model)
-        extra_body = _extra_body(model, params.get("fallback_models"))
+        requested = params.get("model", DEFAULT_TIER)
+        models = resolve_models(requested, params.get("fallback_models"))
+        logger.debug("model=%r -> %s", requested, models)
+        extra_body = _extra_body(MODEL_TIERS.get(requested, {}).get("reasoning"))
 
         correctness_decision_raw = params.get(
             'correctness_decision', default_correctness_decision(context)
@@ -619,10 +633,10 @@ def evaluation_function(
         # in flight when the client is closed.
         with ThreadPoolExecutor(max_workers=2) as pool:
             moderation_future = pool.submit(
-                check_moderation, client, model, moderation_prompt, response, deadline, extra_body
+                check_moderation, client, models, moderation_prompt, response, deadline, extra_body
             )
             correctness_future = pool.submit(
-                check_correctness, client, model, correctness_decision, response, deadline, extra_body
+                check_correctness, client, models, correctness_decision, response, deadline, extra_body
             )
 
         # A response that hasn't passed moderation can't be graded, so its
@@ -643,7 +657,7 @@ def evaluation_function(
 
         try:
             feedback_text = generate_feedback(
-                client, model, correctness_decision, feedback_guidance, is_correct, response,
+                client, models, correctness_decision, feedback_guidance, is_correct, response,
                 deadline, extra_body,
             )
         except LLMCallError as e:
